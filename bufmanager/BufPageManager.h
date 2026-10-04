@@ -172,5 +172,53 @@ public:
 			addr[i] = NULL;
 		}
 	}
+
+	int flushFile(int fileID) {
+		for (int i = 0; i < CAP; ++i) {
+			int f, p;
+			hash->getKeys(i, f, p);
+
+			// 这个缓存帧为空，或者属于其他文件
+			if (f != fileID)
+				continue;
+
+			if (dirty[i]) {
+				if (fileManager->writePage(f, p, addr[i], 0) != 0)
+					return -1;
+
+				dirty[i] = false;
+			}
+		}
+
+		return 0;
+	}
+
+	int flushAndInvalidateFile(int fileID) {
+		// 先统一写回；失败时暂时不移除任何页面
+		if (flushFile(fileID) != 0)
+			return -1;
+
+		for (int i = 0; i < CAP; ++i) {
+			int f, p;
+			hash->getKeys(i, f, p);
+
+			if (f != fileID)
+				continue;
+
+			// flushFile 成功后已经不是脏页
+			dirty[i] = false;
+
+			// 将缓存帧归还替换队列
+			replace->free(i);
+
+			// 删除 (fileID, pageID) → frame 的映射
+			hash->remove(i);
+
+			if (last == i)
+				last = -1;
+		}
+
+		return 0;
+	}
 };
 #endif

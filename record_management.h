@@ -11,6 +11,7 @@
 #define PID(x) ((int)(x>>32))
 #define SID(x) ((int)(x&0xFFFFFFFF))
 #define RID(x,y) (((ull)(x)<<32)|((ull)(y)))
+#define MAX_STR 32
 /*
 数据页元数据
 槽容量 已使用槽数量 后继页
@@ -35,19 +36,19 @@ schema
 列 类型 偏移量
 */
 struct Col{
-    char name[32];
+    char name[MAX_STR];
     int type;//0:INT 1:FLOAT 2:VARCHAR
-    int vcharlen;
+    int len;
     int nullable;
     int defalutable;
-    int default_offset;
-    int default_len;
+    int default_offset;//0 -> null
+    //int default_len;
 };
 struct Schema{
     int recordsize;
     int nullen;
     int col;
-    int offset[32];
+    int offset[33];//offset[col]==recordsize
     Col desc[32];
     char defval[2048];
 };
@@ -61,9 +62,10 @@ struct RecordManager{
     int slotbit;
     int offset;
     int slotcapa;
-    FileManager* fm;
     BufPageManager* bpm;
     TableMeta tbmeta;
+    #ifdef TEST
+    FileManager* fm;
     RecordManager(char* path, Schema& sch){
         fm = new FileManager();
         bpm = new BufPageManager(fm);
@@ -91,11 +93,21 @@ struct RecordManager{
         slotbit = ceil(slotcapa / 8.0);
         offset = DPOFFSET + slotbit;
     }
-    RecordManager(char* path, Schema& sch, FileManager* _fm, BufPageManager* _bpm){
-        fm = _fm;
+    #endif
+    RecordManager(int fid, BufPageManager* _bpm){
         bpm = _bpm;
-        fm->createFile(path);
-        fm->openFile(path,fid);
+        this->fid = fid;
+        int index;
+        BufType metapage = bpm->getPage(fid,0,index);
+        bpm->access(index);
+        memcpy(&tbmeta, metapage, sizeof(TableMeta));
+        slotcapa = 8 * (PAGE_SIZE - 1 - DPOFFSET) / (9*tbmeta.schema.recordsize);
+        slotbit = ceil(slotcapa / 8.0);
+        offset = DPOFFSET + slotbit;
+    }
+    RecordManager(int fid, BufPageManager* _bpm, Schema& sch){
+        this->fid = fid;
+        bpm = _bpm;
         int index;
         BufType tbmetapage = bpm->allocPage(fid,0,index,false);
         tbmeta.head = tbmeta.page = 0;
@@ -106,24 +118,14 @@ struct RecordManager{
         memcpy(tbmetapage,&tbmeta,sizeof(TableMeta));
         bpm->markDirty(index);
     }
-    RecordManager(char* path, FileManager* _fm, BufPageManager* _bpm){
-        fm = _fm;
-        bpm = _bpm;
-        fm->openFile(path,fid);
-        int index;
-        BufType metapage = bpm->getPage(fid,0,index);
-        bpm->access(index);
-        memcpy(&tbmeta, metapage, sizeof(TableMeta));
-        slotcapa = 8 * (PAGE_SIZE - 1 - DPOFFSET) / (9*tbmeta.schema.recordsize);
-        slotbit = ceil(slotcapa / 8.0);
-        offset = DPOFFSET + slotbit;
-    }
+    #ifdef TEST
     ~RecordManager(){
         bpm->close();
         fm->closeFile(fid);
         delete bpm;
         delete fm;
     }
+    #endif
     void LoadRecord(ull rid, char* dest){
         int pid=PID(rid),sid=SID(rid);
         int index, recordsize = tbmeta.schema.recordsize;

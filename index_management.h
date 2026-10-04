@@ -52,16 +52,47 @@ struct PageMeta{
 struct SearchIter{
     int curpid=0; // 0 means the scan has ended.
     int cursid=0;
-    BufType page;
+    char* key=nullptr;
+    char* r=nullptr;
+    bool linclusive=1;
+    bool rinclusive=1;
+    ull rec_rid=0;
 };
 #define INTENTRY(b,sid) ((char*)(b)+((sid)*offset_inter+PAGEMETA))
 #define LEAFENTRY(b,sid) ((char*)(b)+((sid)*offset_leaf+PAGEMETA))
+inline bool KeyColumnIsNull(const char* key, int col)  {
+    const auto* bitmap =
+        reinterpret_cast<const std::uint8_t*>(key);
+
+    return (bitmap[col >> 3] &
+            (std::uint8_t(1) << (col & 7))) != 0;
+}
+
+inline bool KeyHasNull(const char* key, int col)  {
+    for (int i = 0; i < col; ++i) {
+        if (KeyColumnIsNull(key, i))
+            return true;
+    }
+    return false;
+}
+inline void SetKeyColumnNull(char* key, int col) {
+    auto* bitmap =
+        reinterpret_cast<std::uint8_t*>(key);
+    bitmap[col >> 3] |=
+        std::uint8_t(1) << (col & 7);
+}
+inline void ClearKeyColumnNull(char* key, int col) {
+    auto* bitmap =
+        reinterpret_cast<std::uint8_t*>(key);
+
+    bitmap[col >> 3] &=
+        ~(std::uint8_t(1) << (col & 7));
+}
 struct BPT{
     BPTMeta meta;
-    FileManager* fm;
     BufPageManager* bpm;
     int fid;
-    int offset_inter,offset_leaf,keylen;
+    int offset_inter,offset_leaf,keylen,nullen;
     int L;
     int I;
     int Lmin;
@@ -121,6 +152,8 @@ struct BPT{
         bpm->markDirty(index);
         return ;
     }
+    #ifdef TEST
+    FileManager* fm;
     BPT(char* path){
         fm = new FileManager();
         bpm = new BufPageManager(fm);
@@ -129,6 +162,7 @@ struct BPT{
         BufType metapage = bpm->getPage(fid,0,index);
         memcpy(static_cast<void*>(&meta),metapage,sizeof(meta));
         keylen = meta.offset[meta.col];
+        nullen = (meta.col+7)/8;
         offset_inter = keylen+12;
         offset_leaf = keylen+8;
         #ifndef TEST
@@ -152,6 +186,7 @@ struct BPT{
         meta = meta2;
         bpm->markDirty(index);
         keylen = meta.offset[meta.col];
+        nullen = (meta.col+7)/8;
         offset_inter = keylen+12;
         offset_leaf = keylen+8;
         #ifndef TEST
@@ -164,14 +199,15 @@ struct BPT{
         Lmin = (L+1)/2, Imin = (I+1)/2;
         AllocPage(0);
     }
-    BPT(char* path, FileManager* _fm, BufPageManager* _bpm){
-        fm = _fm;
+    #endif
+    BPT(int fid, BufPageManager* _bpm){
         bpm = _bpm;
-        fm->openFile(path,fid);
+        this->fid = fid;
         int index;
         BufType metapage = bpm->getPage(fid,0,index);
         memcpy(static_cast<void*>(&meta),metapage,sizeof(meta));
         keylen = meta.offset[meta.col];
+        nullen = (meta.col+7)/8;
         offset_inter = keylen+12;
         offset_leaf = keylen+8;
         #ifndef TEST
@@ -183,11 +219,9 @@ struct BPT{
         #endif
         Lmin = (L+1)/2, Imin = (I+1)/2;
     }
-    BPT(char* path,BPTMeta& meta2, FileManager* _fm, BufPageManager* _bpm){
-        fm = _fm;
+    BPT(int fid, BufPageManager* _bpm,BPTMeta& meta2){
+        this->fid = fid;
         bpm = _bpm;
-        fm->createFile(path);
-        fm->openFile(path,fid);
         int index;
         BufType metapage = bpm->allocPage(fid,0,index,false);
         memset(metapage,0,PAGE_SIZE);
@@ -195,6 +229,7 @@ struct BPT{
         meta = meta2;
         bpm->markDirty(index);
         keylen = meta.offset[meta.col];
+        nullen = (meta.col+7)/8;
         offset_inter = keylen+12;
         offset_leaf = keylen+8;
         #ifndef TEST
@@ -207,15 +242,29 @@ struct BPT{
         Lmin = (L+1)/2, Imin = (I+1)/2;
         AllocPage(0);
     }
+    #ifdef TEST
     ~BPT(){
         bpm->close();
         fm->closeFile(fid);
         delete bpm;
         delete fm;
     }
+    #endif
     int cmp(char* l,char* r,ull lrid,ull rrid){
         //l<r -1 = 0 > 1
         for(int i=0;i<meta.col;i++){
+            bool lnull =
+                static_cast<unsigned char>(l[i >> 3]) &
+                (1u << (i & 7));
+            bool rnull =
+                static_cast<unsigned char>(r[i >> 3]) &
+                (1u << (i & 7));
+            if (lnull != rnull)
+                return lnull ? -1 : 1;
+            if (lnull) {
+                continue;
+            }
+            //比较时NULL比所有非NULL值小
             int idx=meta.offset[i];
             if(meta.type[i]==0){//int
                 int ll,rr;
@@ -281,39 +330,58 @@ struct BPT{
             }
         }
     }
-    SearchIter SearchRange(char* l,bool inclusive){
-        int index,tmp=Search(l,inclusive?RIDMIN:RIDMAX);
+    SearchIter SearchRange(char* l,char* r,bool linclusive,bool rinclusive){
+        int index,tmp=Search(l,linclusive?RIDMIN:RIDMAX);
         SearchIter res{_path[tmp][0],_path[tmp][1]};
-        res.page=bpm->getPage(fid,res.curpid,index);
-        if(res.cursid >= res.page[1]){
+        res.linclusive = linclusive, res.rinclusive=rinclusive;
+        res.r = r;
+        BufType page=bpm->getPage(fid,res.curpid,index);
+        if(res.cursid >= page[1]){
             res.curpid = res.cursid =0;
-            res.page = nullptr;
+            res.key = nullptr;
+        }else{
+            res.key = LEAFENTRY(page, res.cursid);
+            res.rec_rid = LEAFRID(page,res.cursid);
         }
         return res;
     }
-    bool Next(SearchIter& i,char* r,ull& rid,bool inclusive=true){
+    bool Next(SearchIter& i){
         int index;
-        BufType page=i.page;
-        while(i.curpid!=0){
-            if(r!=nullptr){
-                int order=cmp(LEAFENTRY(page,i.cursid),r,0,0);
-                if(order>0 || (order==0 && !inclusive)){
-                    i.curpid=0;
-                    return false;
-                }
-            }
-            rid=LEAFRID(page,i.cursid);
+        if(i.curpid!=0){
+            BufType page=bpm->getPage(fid,i.curpid,index);
             i.cursid++;
             if(i.cursid>=(int)page[1]){
                 i.curpid=page[3];
                 i.cursid=0;
-                if(i.curpid)i.page = bpm->getPage(fid,i.curpid,index);
-                else i.page = nullptr;
+                if(i.curpid){
+                    page = bpm->getPage(fid,i.curpid,index);
+                }
+                else {
+                    i.key = nullptr;
+                    page = nullptr;
+                    i.rec_rid = 0;
+                    return false;
+                }
             }
+            i.key = LEAFENTRY(page, i.cursid);
+            i.rec_rid = LEAFRID(page,i.cursid);
             return true;
         }
         return false;
-    }//迭代器必须一次性使用完
+    }
+    bool Valid(const SearchIter& i) {
+        if (i.curpid == 0 || i.key == nullptr)
+            return false;
+        if (i.r == nullptr)
+            return true;
+        int order = cmp(i.key, i.r, 0, 0);
+        return order < 0 || (order == 0 && i.rinclusive);
+    }
+    bool Exist(char* key){
+        SearchIter iter=SearchRange(key,key,1,1);
+        if(Valid(iter))return true;
+        else return false;
+    }
     void _updatemax(int level, char* key){
         int index;
         for(int i=level;i>=0;i--){
@@ -337,7 +405,7 @@ struct BPT{
     }
     int InsertEntry(char* key, ull rid){//key + 表rid。返回状态
         int index,cnt;
-        if(meta.unique){
+        if(meta.unique && !KeyHasNull(key,meta.col)){
             cnt = Search(key,RIDMIN);
             int uni_pid = _path[cnt][0],uni_sid = _path[cnt][1];
             BufType b = bpm->getPage(fid,uni_pid,index);

@@ -33,6 +33,14 @@ namespace {
 
 using Entry = std::pair<int, ull>;
 
+constexpr int kNullBytes = 1;
+constexpr int kKeySize = kNullBytes + static_cast<int>(sizeof(int));
+
+static_assert(sizeof(BPTMeta) == BPTMETA,
+              "BPTMeta no longer matches the on-disk metadata layout");
+static_assert(sizeof(PageMeta) == PAGEMETA,
+              "PageMeta no longer matches the on-disk page layout");
+
 void require(bool condition, const std::string& message) {
     if (!condition) {
         throw std::runtime_error(message);
@@ -53,13 +61,19 @@ BPTMeta makeMeta(bool unique) {
     meta.unique = unique ? 1 : 0;
     meta.col = 1;
     meta.type[0] = 0;
-    meta.offset[0] = 0;
-    meta.offset[1] = static_cast<int>(sizeof(int));
+    meta.offset[0] = kNullBytes;
+    meta.offset[1] = kKeySize;
     return meta;
 }
 
 void writeKey(int value, char* key) {
-    std::memcpy(key, &value, sizeof(value));
+    std::memset(key, 0, kKeySize);
+    std::memcpy(key + kNullBytes, &value, sizeof(value));
+}
+
+void writeNullKey(char* key) {
+    std::memset(key, 0, kKeySize);
+    SetKeyColumnNull(key, 0);
 }
 
 struct NodeSummary {
@@ -78,10 +92,10 @@ struct NodeSnapshot {
     std::vector<int> children;
 };
 
-Entry readEntry(const char* entry, int keylen) {
+Entry readEntry(const char* entry, int keyOffset, int keylen) {
     int key = 0;
     ull rid = 0;
-    std::memcpy(&key, entry, sizeof(key));
+    std::memcpy(&key, entry + keyOffset, sizeof(key));
     std::memcpy(&rid, entry + keylen, sizeof(rid));
     return {key, rid};
 }
@@ -103,7 +117,8 @@ NodeSnapshot snapshot(BPT& tree, int pid) {
     const char* data = reinterpret_cast<const char*>(page) + PAGEMETA;
     const int stride = result.type == 0 ? tree.offset_leaf : tree.offset_inter;
     for (int sid = 0; sid < result.count; ++sid) {
-        result.entries.push_back(readEntry(data + sid * stride, tree.keylen));
+        result.entries.push_back(
+            readEntry(data + sid * stride, tree.meta.offset[0], tree.keylen));
         if (result.type == 1) {
             int child = 0;
             std::memcpy(&child, data + sid * stride + tree.keylen + 8,
@@ -142,6 +157,10 @@ NodeSummary validateNode(BPT& tree, int pid, bool isRoot,
         return summary;
     }
 
+    if (isRoot) {
+        require(node.count >= 2,
+                "internal root with fewer than two children was not contracted");
+    }
     require(node.count > 0, "internal page has no child entries");
     require(node.children.size() == node.entries.size(),
             "internal child count does not match entry count");
@@ -177,6 +196,8 @@ int validateTree(BPT& tree) {
     require(root == tree.meta.root, "in-memory root differs from page metadata");
     require(head == tree.meta.lhead, "in-memory leaf head differs from metadata");
     require(tail == tree.meta.ltail, "in-memory leaf tail differs from metadata");
+    require(static_cast<int>(rawMeta[3]) == tree.meta.freehead,
+            "in-memory free-list head differs from page metadata");
     require(static_cast<int>(rawMeta[4]) == tree.meta.page,
             "in-memory page count differs from metadata");
 
@@ -212,11 +233,30 @@ int validateTree(BPT& tree) {
     require(chainVisited == std::set<int>(rootSummary.leaves.begin(),
                                           rootSummary.leaves.end()),
             "some reachable leaf is missing from the sibling chain");
+
+    std::set<int> freePages;
+    pid = tree.meta.freehead;
+    while (pid != 0) {
+        require(pid > 0 && pid <= tree.meta.page,
+                "free list points outside the allocated page range");
+        require(freePages.insert(pid).second,
+                "free page list contains a cycle");
+        require(visited.count(pid) == 0,
+                "an active tree page also appears in the free list");
+        int index = -1;
+        BufType page = tree.bpm->getPage(tree.fid, pid, index);
+        require(static_cast<int>(page[0]) == 2,
+                "free list contains a page not marked free");
+        pid = static_cast<int>(page[3]);
+    }
+    require(visited.size() + freePages.size() ==
+                static_cast<std::size_t>(tree.meta.page),
+            "allocated page is neither reachable nor on the free list");
     return rootSummary.depth;
 }
 
 void checkExactEntries(BPT& tree, const std::vector<Entry>& entries) {
-    char key[sizeof(int)];
+    char key[kKeySize];
     for (const Entry& entry : entries) {
         writeKey(entry.first, key);
         const int level = tree.Search(key, entry.second);
@@ -248,7 +288,7 @@ std::vector<ull> expectedRange(const std::vector<Entry>& entries, int lower,
 }
 
 void checkSearchInsertionPoint(BPT& tree, const Entry& target) {
-    char key[sizeof(int)];
+    char key[kKeySize];
     writeKey(target.first, key);
     const int level = tree.Search(key, target.second);
     const int pid = tree._path[level][0];
@@ -273,19 +313,24 @@ void checkSearchInsertionPoint(BPT& tree, const Entry& target) {
 
 void checkRanges(BPT& tree, const std::vector<Entry>& model,
                  int lower, int upper) {
-    char lowerKey[sizeof(int)];
-    char upperKey[sizeof(int)];
+    char lowerKey[kKeySize];
+    char upperKey[kKeySize];
     writeKey(lower, lowerKey);
     writeKey(upper, upperKey);
     const bool combinations[][2] = {
         {true, true}, {true, false}, {false, true}, {false, false}};
     for (const auto& combination : combinations) {
-        SearchIter iter = tree.SearchRange(lowerKey, combination[0]);
+        SearchIter iter =
+            tree.SearchRange(lowerKey, upperKey, combination[0]);
+        // SearchRange currently has one inclusivity argument. It is used for
+        // the lower bound during positioning; set the iterator's upper-bound
+        // policy separately so all four boundary combinations are exercised.
+        iter.inclusive = combination[1];
         std::vector<ull> actual;
-        for (std::size_t count = 0; count <= model.size(); ++count) {
-            ull rid = 0;
-            if (!tree.Next(iter, upperKey, rid, combination[1])) break;
-            actual.push_back(rid);
+        for (std::size_t count = 0;
+             count <= model.size() && tree.Valid(iter); ++count) {
+            actual.push_back(iter.rec_rid);
+            tree.Next(iter);
         }
         require(actual == expectedRange(model, lower, combination[0], upper,
                                        combination[1]),
@@ -305,34 +350,41 @@ BPT* createTree(const std::string& path, bool unique = false) {
     return tree;
 }
 
+BPT* createTreeWithMeta(const std::string& path, BPTMeta meta) {
+    std::remove(path.c_str());
+    BPT* tree = new BPT(const_cast<char*>(path.c_str()), meta);
+    tree->L = TEST_T;
+    tree->I = TEST_I;
+    tree->Lmin = (tree->L + 1) / 2;
+    tree->Imin = (tree->I + 1) / 2;
+    return tree;
+}
+
 void checkFullScan(BPT& tree, const std::vector<Entry>& inserted) {
     std::vector<Entry> expected = inserted;
     std::sort(expected.begin(), expected.end());
 
-    char lower[sizeof(int)];
+    char lower[kKeySize];
     writeKey(std::numeric_limits<int>::min(), lower);
-    SearchIter iter = tree.SearchRange(lower, true);
+    SearchIter iter = tree.SearchRange(lower, nullptr, true);
     std::vector<Entry> actual;
     actual.reserve(expected.size());
 
-    char* noUpper = nullptr;
-    for (std::size_t n = 0; n <= expected.size(); ++n) {
-        ull rid = 0;
-        if (!tree.Next(iter, noUpper, rid)) {
-            break;
-        }
+    for (std::size_t n = 0;
+         n <= expected.size() && tree.Valid(iter); ++n) {
+        const ull rid = iter.rec_rid;
         auto found = std::find_if(
             inserted.begin(), inserted.end(),
             [rid](const Entry& entry) { return entry.second == rid; });
         require(found != inserted.end(), "scan returned an unknown RID");
         actual.push_back(*found);
+        tree.Next(iter);
     }
 
     require(actual == expected,
             "full leaf scan did not return entries in key/RID order");
 
-    ull extraRid = 0;
-    require(!tree.Next(iter, noUpper, extraRid),
+    require(!tree.Valid(iter) && !tree.Next(iter),
             "full leaf scan returned more entries than were inserted");
 }
 
@@ -340,11 +392,10 @@ void testEmptyAndSingleEntry() {
     const std::string path = testPath("empty_single");
     BPT* tree = createTree(path);
 
-    char key[sizeof(int)];
+    char key[kKeySize];
     writeKey(7, key);
-    SearchIter empty = tree->SearchRange(key, true);
-    ull rid = 0;
-    require(!tree->Next(empty, nullptr, rid),
+    SearchIter empty = tree->SearchRange(key, nullptr, true);
+    require(!tree->Valid(empty) && !tree->Next(empty),
             "empty tree produced a range result");
 
     const ull insertedRid = RID(9, 1);
@@ -353,10 +404,11 @@ void testEmptyAndSingleEntry() {
     require(tree->InsertEntry(key, insertedRid) == -1,
             "exact duplicate was accepted");
 
-    SearchIter iter = tree->SearchRange(key, true);
-    require(tree->Next(iter, key, rid), "single entry was not found");
-    require(rid == insertedRid, "single entry returned the wrong RID");
-    require(!tree->Next(iter, key, rid),
+    SearchIter iter = tree->SearchRange(key, key, true);
+    require(tree->Valid(iter), "single entry was not found");
+    require(iter.rec_rid == insertedRid,
+            "single entry returned the wrong RID");
+    require(!tree->Next(iter) && !tree->Valid(iter),
             "single-entry range returned an extra result");
 
     delete tree;
@@ -367,7 +419,7 @@ void testDuplicateAndExactDuplicate() {
     const std::string path = testPath("duplicates");
     BPT* tree = createTree(path);
     std::vector<Entry> inserted;
-    char key[sizeof(int)];
+    char key[kKeySize];
 
     for (int i = 0; i < 9; ++i) {
         writeKey(i == 4 ? 5 : i, key);
@@ -397,7 +449,7 @@ void testDuplicateAndExactDuplicate() {
 void testExactDuplicateAtSearchBoundaries() {
     const std::string path = testPath("exact_search_boundaries");
     BPT* tree = createTree(path);
-    char key[sizeof(int)];
+    char key[kKeySize];
 
     // With two leaf entries, the second entry is the lower-bound result but
     // is not necessarily compared inside Search's binary-search loop.
@@ -419,8 +471,8 @@ void testExactDuplicateAtSearchBoundaries() {
 void testUniqueIndex() {
     const std::string path = testPath("unique");
     BPT* tree = createTree(path, true);
-    char first[sizeof(int)];
-    char second[sizeof(int)];
+    char first[kKeySize];
+    char second[kKeySize];
     writeKey(42, first);
     writeKey(42, second);
 
@@ -430,7 +482,520 @@ void testUniqueIndex() {
             "unique index accepted a duplicate key");
 
     delete tree;
+
+    BPT reopened(const_cast<char*>(path.c_str()));
+    reopened.L = TEST_T;
+    reopened.I = TEST_I;
+    reopened.Lmin = (reopened.L + 1) / 2;
+    reopened.Imin = (reopened.I + 1) / 2;
+    require(reopened.meta.unique == 1,
+            "unique flag was not restored from index metadata");
+    require(reopened.InsertEntry(second, RID(12, 2)) == -2,
+            "reopened unique index accepted a duplicate key");
+    writeKey(43, second);
+    require(reopened.InsertEntry(second, RID(12, 3)) == 0,
+            "reopened unique index rejected a distinct key");
     std::remove(path.c_str());
+}
+
+void testNullKeysAcrossLeavesAndPersistence() {
+    const std::string path = testPath("null_keys");
+    std::vector<Entry> expected;
+    char nullKey[kKeySize];
+    char valueKey[kKeySize];
+    writeNullKey(nullKey);
+
+    {
+        BPT* tree = createTree(path);
+
+        // Insert in reverse RID order so the test also verifies that NULL keys
+        // are ordered by RID and survive leaf/internal splits.
+        for (unsigned ridNumber = 9; ridNumber >= 1; --ridNumber) {
+            const ull rid = RID(24, ridNumber);
+            require(tree->InsertEntry(nullKey, rid) == 0,
+                    "NULL-key insertion failed");
+            expected.emplace_back(0, rid);
+        }
+        for (int value = 1; value <= 8; ++value) {
+            const ull rid = RID(25, static_cast<unsigned>(value));
+            writeKey(value, valueKey);
+            require(tree->InsertEntry(valueKey, rid) == 0,
+                    "non-NULL fixture insertion failed");
+            expected.emplace_back(value, rid);
+        }
+
+        require(validateTree(*tree) >= 3,
+                "NULL-key fixture did not split into a multi-level tree");
+
+        SearchIter all = tree->SearchRange(nullKey, nullptr, true);
+        std::vector<Entry> actual;
+        while (tree->Valid(all)) {
+            int value = 0;
+            if (!KeyColumnIsNull(all.key, 0)) {
+                std::memcpy(&value, all.key + kNullBytes, sizeof(value));
+            }
+            actual.emplace_back(value, all.rec_rid);
+            tree->Next(all);
+        }
+        std::sort(expected.begin(), expected.end());
+        require(actual == expected,
+                "full scan did not order NULL keys before non-NULL keys");
+
+        SearchIter onlyNull = tree->SearchRange(nullKey, nullKey, true);
+        std::vector<ull> nullRids;
+        while (tree->Valid(onlyNull)) {
+            require(KeyColumnIsNull(onlyNull.key, 0),
+                    "NULL equality range returned a non-NULL key");
+            nullRids.push_back(onlyNull.rec_rid);
+            tree->Next(onlyNull);
+        }
+        std::vector<ull> expectedNullRids;
+        for (unsigned ridNumber = 1; ridNumber <= 9; ++ridNumber) {
+            expectedNullRids.push_back(RID(24, ridNumber));
+        }
+        require(nullRids == expectedNullRids,
+                "NULL equality range lost or reordered entries");
+
+        require(tree->DeleteEntry(nullKey, RID(24, 5)) == 0,
+                "deleting a NULL-key entry failed");
+        require(tree->DeleteEntry(nullKey, RID(24, 5)) == -1,
+                "deleting the same NULL-key entry twice succeeded");
+        validateTree(*tree);
+        delete tree;
+    }
+
+    BPT reopened(const_cast<char*>(path.c_str()));
+    reopened.L = TEST_T;
+    reopened.I = TEST_I;
+    reopened.Lmin = (reopened.L + 1) / 2;
+    reopened.Imin = (reopened.I + 1) / 2;
+    SearchIter onlyNull = reopened.SearchRange(nullKey, nullKey, true);
+    std::vector<ull> reopenedRids;
+    while (reopened.Valid(onlyNull)) {
+        reopenedRids.push_back(onlyNull.rec_rid);
+        reopened.Next(onlyNull);
+    }
+    require(std::find(reopenedRids.begin(), reopenedRids.end(), RID(24, 5)) ==
+                reopenedRids.end() &&
+                reopenedRids.size() == 8,
+            "NULL-key deletion was not persisted");
+
+    // Remove all remaining NULL entries. This forces NULL-containing leaf
+    // separators through borrowing, merging, and root contraction paths.
+    for (unsigned ridNumber = 1; ridNumber <= 9; ++ridNumber) {
+        if (ridNumber == 5) continue;
+        require(reopened.DeleteEntry(nullKey, RID(24, ridNumber)) == 0,
+                "NULL-key deletion failed during rebalance");
+        validateTree(reopened);
+    }
+    SearchIter noNulls = reopened.SearchRange(nullKey, nullKey, true);
+    require(!reopened.Valid(noNulls),
+            "NULL equality range remained nonempty after deleting all NULLs");
+    char firstValue[kKeySize];
+    writeKey(1, firstValue);
+    SearchIter remaining = reopened.SearchRange(firstValue, nullptr, true);
+    int remainingCount = 0;
+    while (reopened.Valid(remaining)) {
+        ++remainingCount;
+        reopened.Next(remaining);
+    }
+    require(remainingCount == 8,
+            "NULL-key rebalance damaged neighboring non-NULL entries");
+    std::remove(path.c_str());
+}
+
+void testUniqueAllowsNullKeys() {
+    const std::string path = testPath("unique_null");
+    BPT* tree = createTree(path, true);
+    char nullKey[kKeySize];
+    char valueKey[kKeySize];
+    writeNullKey(nullKey);
+    writeKey(42, valueKey);
+
+    require(tree->InsertEntry(nullKey, RID(26, 1)) == 0,
+            "unique index rejected its first NULL key");
+    require(tree->InsertEntry(nullKey, RID(26, 2)) == 0,
+            "unique index rejected a second NULL key");
+    require(tree->InsertEntry(nullKey, RID(26, 1)) == -1,
+            "unique index accepted an exact duplicate NULL key/RID");
+    require(tree->InsertEntry(valueKey, RID(26, 3)) == 0,
+            "unique index rejected a non-NULL key");
+    require(tree->InsertEntry(valueKey, RID(26, 4)) == -2,
+            "unique index accepted a duplicate non-NULL key");
+
+    delete tree;
+    std::remove(path.c_str());
+}
+
+void writeCompositeKey(int first, bool firstNull, int second,
+                       bool secondNull, char* key) {
+    constexpr int compositeKeySize = 1 + 2 * static_cast<int>(sizeof(int));
+    std::memset(key, 0, compositeKeySize);
+    if (firstNull) {
+        SetKeyColumnNull(key, 0);
+    } else {
+        std::memcpy(key + 1, &first, sizeof(first));
+    }
+    if (secondNull) {
+        SetKeyColumnNull(key, 1);
+    } else {
+        std::memcpy(key + 1 + sizeof(int), &second, sizeof(second));
+    }
+}
+
+void testCompositeUniqueNullSemantics() {
+    const std::string path = testPath("composite_unique_null");
+    std::remove(path.c_str());
+    BPTMeta meta{};
+    meta.root = meta.lhead = meta.ltail = 1;
+    meta.unique = 1;
+    meta.col = 2;
+    meta.type[0] = meta.type[1] = 0;
+    meta.offset[0] = 1;
+    meta.offset[1] = 1 + static_cast<int>(sizeof(int));
+    meta.offset[2] = 1 + 2 * static_cast<int>(sizeof(int));
+    BPT* tree = new BPT(const_cast<char*>(path.c_str()), meta);
+    tree->L = TEST_T;
+    tree->I = TEST_I;
+    tree->Lmin = (tree->L + 1) / 2;
+    tree->Imin = (tree->I + 1) / 2;
+
+    char partialNull[1 + 2 * sizeof(int)];
+    char leadingNull[1 + 2 * sizeof(int)];
+    char nonNull[1 + 2 * sizeof(int)];
+    char allNull[1 + 2 * sizeof(int)];
+    writeCompositeKey(7, false, 0, true, partialNull);
+    writeCompositeKey(0, true, 9, false, leadingNull);
+    writeCompositeKey(7, false, 9, false, nonNull);
+    writeCompositeKey(0, true, 0, true, allNull);
+
+    require(KeyHasNull(partialNull, 2) && KeyHasNull(leadingNull, 2) &&
+                !KeyHasNull(nonNull, 2),
+            "composite NULL bitmap was decoded incorrectly");
+    require(tree->InsertEntry(partialNull, RID(27, 1)) == 0 &&
+                tree->InsertEntry(partialNull, RID(27, 2)) == 0,
+            "composite unique index rejected duplicate partial-NULL keys");
+    require(tree->InsertEntry(leadingNull, RID(27, 3)) == 0 &&
+                tree->InsertEntry(leadingNull, RID(27, 4)) == 0,
+            "composite unique index rejected duplicate leading-NULL keys");
+    require(tree->InsertEntry(nonNull, RID(27, 5)) == 0,
+            "composite unique index rejected a non-NULL key");
+    require(tree->InsertEntry(nonNull, RID(27, 6)) == -2,
+            "composite unique index accepted a duplicate non-NULL key");
+
+    SearchIter scan = tree->SearchRange(allNull, nullptr, true);
+    std::vector<ull> actualOrder;
+    while (tree->Valid(scan)) {
+        actualOrder.push_back(scan.rec_rid);
+        tree->Next(scan);
+    }
+    require(actualOrder ==
+                std::vector<ull>({RID(27, 3), RID(27, 4), RID(27, 1),
+                                  RID(27, 2), RID(27, 5)}),
+            "composite NULL keys were not ordered lexicographically");
+
+    delete tree;
+    std::remove(path.c_str());
+}
+
+void testNullBitmapAcrossByteBoundary() {
+    constexpr int columnCount = 9;
+    constexpr int nullBytes = 2;
+    constexpr int wideKeySize =
+        nullBytes + columnCount * static_cast<int>(sizeof(int));
+    const std::string path = testPath("wide_null_bitmap");
+
+    BPTMeta meta{};
+    meta.root = meta.lhead = meta.ltail = 1;
+    meta.unique = 1;
+    meta.col = columnCount;
+    meta.offset[0] = nullBytes;
+    for (int i = 0; i < columnCount; ++i) {
+        meta.type[i] = 0;
+        meta.offset[i + 1] = meta.offset[i] + sizeof(int);
+    }
+    BPT* tree = createTreeWithMeta(path, meta);
+
+    auto writeWideKey = [&](char* key, int nullColumn) {
+        std::memset(key, 0, wideKeySize);
+        for (int i = 0; i < columnCount; ++i) {
+            const int value = 100 + i;
+            std::memcpy(key + meta.offset[i], &value, sizeof(value));
+        }
+        if (nullColumn >= 0) SetKeyColumnNull(key, nullColumn);
+    };
+
+    char nullAtSeven[wideKeySize];
+    char nullAtEight[wideKeySize];
+    char nonNull[wideKeySize];
+    char cleared[wideKeySize];
+    char allNull[wideKeySize];
+    writeWideKey(nullAtSeven, 7);
+    writeWideKey(nullAtEight, 8);
+    writeWideKey(nonNull, -1);
+    std::memcpy(cleared, nullAtEight, wideKeySize);
+    ClearKeyColumnNull(cleared, 8);
+    writeWideKey(allNull, -1);
+    for (int i = 0; i < columnCount; ++i) SetKeyColumnNull(allNull, i);
+
+    require(KeyColumnIsNull(nullAtSeven, 7) &&
+                !KeyColumnIsNull(nullAtSeven, 8) &&
+                KeyColumnIsNull(nullAtEight, 8),
+            "NULL bitmap failed across the byte-7/byte-8 boundary");
+    require(!KeyHasNull(cleared, columnCount) &&
+                tree->cmp(cleared, nonNull, 0, 0) == 0,
+            "clearing a NULL bit in the second bitmap byte failed");
+    require(tree->cmp(nullAtSeven, nullAtEight, 0, 0) < 0 &&
+                tree->cmp(nullAtEight, nonNull, 0, 0) < 0,
+            "multi-byte NULL bitmap did not participate in lexicographic order");
+
+    require(tree->InsertEntry(nullAtSeven, RID(28, 1)) == 0 &&
+                tree->InsertEntry(nullAtEight, RID(28, 2)) == 0 &&
+                tree->InsertEntry(nullAtEight, RID(28, 3)) == 0 &&
+                tree->InsertEntry(nonNull, RID(28, 4)) == 0 &&
+                tree->InsertEntry(allNull, RID(28, 5)) == 0,
+            "wide NULL-bitmap insertion failed");
+    require(tree->InsertEntry(nonNull, RID(28, 6)) == -2,
+            "wide unique index accepted a duplicate non-NULL key");
+    require(tree->meta.root != 1,
+            "wide NULL-bitmap fixture did not exercise a leaf split");
+
+    SearchIter scan = tree->SearchRange(allNull, nullptr, true);
+    int count = 0;
+    while (tree->Valid(scan)) {
+        ++count;
+        tree->Next(scan);
+    }
+    require(count == 5, "wide NULL-bitmap scan lost entries");
+
+    delete tree;
+    std::remove(path.c_str());
+}
+
+void testFloatKeyOrderingAndRanges() {
+    constexpr int floatKeySize = 1 + static_cast<int>(sizeof(double));
+    const std::string path = testPath("float_keys");
+    BPTMeta meta{};
+    meta.root = meta.lhead = meta.ltail = 1;
+    meta.unique = 0;
+    meta.col = 1;
+    meta.type[0] = 1;
+    meta.offset[0] = 1;
+    meta.offset[1] = floatKeySize;
+    BPT* tree = createTreeWithMeta(path, meta);
+
+    auto writeFloatKey = [](double value, char* key) {
+        std::memset(key, 0, floatKeySize);
+        std::memcpy(key + 1, &value, sizeof(value));
+    };
+    using FloatEntry = std::pair<double, ull>;
+    const std::vector<double> values = {
+        3.5, -2.25, 0.0, 17.0, -100.5, 3.5, 1.25,
+        std::numeric_limits<double>::infinity(),
+        -std::numeric_limits<double>::infinity(), 8.75,
+    };
+    std::vector<FloatEntry> expected;
+    char key[floatKeySize];
+    unsigned ridNumber = 1;
+    for (double value : values) {
+        const ull rid = RID(29, ridNumber++);
+        writeFloatKey(value, key);
+        require(tree->InsertEntry(key, rid) == 0,
+                "FLOAT-key insertion failed");
+        expected.emplace_back(value, rid);
+    }
+    require(tree->meta.root != 1,
+            "FLOAT-key fixture did not exercise a leaf split");
+
+    char lower[floatKeySize];
+    writeFloatKey(-std::numeric_limits<double>::infinity(), lower);
+    SearchIter scan = tree->SearchRange(lower, nullptr, true);
+    std::vector<FloatEntry> actual;
+    while (tree->Valid(scan)) {
+        double value = 0;
+        std::memcpy(&value, scan.key + 1, sizeof(value));
+        actual.emplace_back(value, scan.rec_rid);
+        tree->Next(scan);
+    }
+    std::sort(expected.begin(), expected.end());
+    require(actual == expected, "FLOAT keys were not scanned in numeric order");
+
+    char rangeLower[floatKeySize];
+    char rangeUpper[floatKeySize];
+    writeFloatKey(-2.25, rangeLower);
+    writeFloatKey(3.5, rangeUpper);
+    SearchIter range = tree->SearchRange(rangeLower, rangeUpper, true);
+    std::vector<FloatEntry> ranged;
+    while (tree->Valid(range)) {
+        double value = 0;
+        std::memcpy(&value, range.key + 1, sizeof(value));
+        ranged.emplace_back(value, range.rec_rid);
+        tree->Next(range);
+    }
+    std::vector<FloatEntry> expectedRangeEntries;
+    for (const FloatEntry& entry : expected) {
+        if (entry.first >= -2.25 && entry.first <= 3.5) {
+            expectedRangeEntries.push_back(entry);
+        }
+    }
+    require(ranged == expectedRangeEntries,
+            "FLOAT closed range returned the wrong entries");
+
+    delete tree;
+    std::remove(path.c_str());
+}
+
+void testVarcharKeyOrderingAndRanges() {
+    constexpr int varcharLength = 8;
+    constexpr int varcharKeySize = 1 + varcharLength;
+    const std::string path = testPath("varchar_keys");
+    BPTMeta meta{};
+    meta.root = meta.lhead = meta.ltail = 1;
+    meta.unique = 0;
+    meta.col = 1;
+    meta.type[0] = 2;
+    meta.offset[0] = 1;
+    meta.offset[1] = varcharKeySize;
+    BPT* tree = createTreeWithMeta(path, meta);
+
+    auto writeVarcharKey = [](const std::string& value, char* key) {
+        std::memset(key, 0, varcharKeySize);
+        std::memcpy(key + 1, value.data(),
+                    std::min(value.size(), static_cast<std::size_t>(varcharLength)));
+    };
+    auto readVarcharKey = [](const char* key) {
+        std::size_t length = 0;
+        while (length < varcharLength && key[1 + length] != '\0') ++length;
+        return std::string(key + 1, length);
+    };
+
+    using StringEntry = std::pair<std::string, ull>;
+    const std::vector<std::string> values = {
+        "b", "", "aa", "a", "z", "ab", "alpha", "alp", "aa", "ba",
+    };
+    std::vector<StringEntry> expected;
+    char key[varcharKeySize];
+    unsigned ridNumber = 1;
+    for (const std::string& value : values) {
+        const ull rid = RID(30, ridNumber++);
+        writeVarcharKey(value, key);
+        require(tree->InsertEntry(key, rid) == 0,
+                "VARCHAR-key insertion failed");
+        expected.emplace_back(value, rid);
+    }
+    require(tree->meta.root != 1,
+            "VARCHAR-key fixture did not exercise a leaf split");
+
+    char lower[varcharKeySize];
+    writeVarcharKey("", lower);
+    SearchIter scan = tree->SearchRange(lower, nullptr, true);
+    std::vector<StringEntry> actual;
+    while (tree->Valid(scan)) {
+        actual.emplace_back(readVarcharKey(scan.key), scan.rec_rid);
+        tree->Next(scan);
+    }
+    std::sort(expected.begin(), expected.end());
+    require(actual == expected,
+            "VARCHAR keys were not scanned in lexicographic order");
+
+    char rangeLower[varcharKeySize];
+    char rangeUpper[varcharKeySize];
+    writeVarcharKey("aa", rangeLower);
+    writeVarcharKey("b", rangeUpper);
+    SearchIter range = tree->SearchRange(rangeLower, rangeUpper, true);
+    range.inclusive = false;
+    std::vector<StringEntry> ranged;
+    while (tree->Valid(range)) {
+        ranged.emplace_back(readVarcharKey(range.key), range.rec_rid);
+        tree->Next(range);
+    }
+    std::vector<StringEntry> expectedRangeEntries;
+    for (const StringEntry& entry : expected) {
+        if (entry.first >= "aa" && entry.first < "b") {
+            expectedRangeEntries.push_back(entry);
+        }
+    }
+    require(ranged == expectedRangeEntries,
+            "VARCHAR half-open range returned the wrong entries");
+
+    delete tree;
+    std::remove(path.c_str());
+}
+
+void runNodeCapacityCase(int leafCapacity, int internalCapacity,
+                         const char* caseName) {
+    const std::string path = testPath(caseName);
+    BPT* tree = createTree(path);
+    tree->L = leafCapacity;
+    tree->I = internalCapacity;
+    tree->Lmin = (tree->L + 1) / 2;
+    tree->Imin = (tree->I + 1) / 2;
+
+    std::vector<Entry> model;
+    char key[kKeySize];
+    for (int value = 0; value < 120; ++value) {
+        const int shuffled = (value * 53) % 127;
+        const ull rid = RID(31 + static_cast<unsigned>(leafCapacity * 10 +
+                                                       internalCapacity),
+                            static_cast<unsigned>(value + 1));
+        writeKey(shuffled, key);
+        require(tree->InsertEntry(key, rid) == 0,
+                "capacity-boundary insertion failed");
+        model.emplace_back(shuffled, rid);
+    }
+    require(validateTree(*tree) >= 4,
+            "capacity-boundary fixture did not create a deep tree");
+    checkFullScan(*tree, model);
+
+    std::vector<Entry> deletionOrder = model;
+    std::sort(deletionOrder.begin(), deletionOrder.end(),
+              [](const Entry& left, const Entry& right) {
+                  const ull leftGroup = left.second % 7;
+                  const ull rightGroup = right.second % 7;
+                  return leftGroup != rightGroup
+                             ? leftGroup < rightGroup
+                             : left.second < right.second;
+              });
+    for (std::size_t i = 0; i < deletionOrder.size(); ++i) {
+        const Entry entry = deletionOrder[i];
+        writeKey(entry.first, key);
+        require(tree->DeleteEntry(key, entry.second) == 0,
+                "capacity-boundary deletion failed");
+        model.erase(std::remove(model.begin(), model.end(), entry), model.end());
+        if (i % 11 == 0) {
+            validateTree(*tree);
+            checkFullScan(*tree, model);
+        }
+    }
+    require(validateTree(*tree) == 1,
+            "capacity-boundary tree did not contract to a leaf root");
+    checkFullScan(*tree, model);
+    delete tree;
+    std::remove(path.c_str());
+}
+
+void testOddNodeCapacities() {
+    const std::vector<std::pair<int, int>> capacities = {
+        {3, 3}, {3, 5}, {5, 3},
+    };
+    int caseNumber = 0;
+    for (const auto& capacity : capacities) {
+        const std::string name =
+            "odd_capacity_" + std::to_string(caseNumber++);
+        runNodeCapacityCase(capacity.first, capacity.second, name.c_str());
+    }
+}
+
+void testMinimumLeafCapacity() {
+    runNodeCapacityCase(2, 3, "minimum_leaf_capacity");
+}
+
+void testMinimumInternalCapacity() {
+    runNodeCapacityCase(3, 2, "minimum_internal_capacity");
+}
+
+void testMinimumLeafAndInternalCapacity() {
+    runNodeCapacityCase(2, 2, "minimum_leaf_internal_capacity");
 }
 
 void testMultiLevelSplitsAndPersistence() {
@@ -438,7 +1003,7 @@ void testMultiLevelSplitsAndPersistence() {
     std::vector<Entry> inserted;
     {
         BPT* tree = createTree(path);
-        char key[sizeof(int)];
+        char key[kKeySize];
 
         for (int i = 0; i < 80; ++i) {
             const int value = (i * 37) % 53;
@@ -466,22 +1031,108 @@ void testMultiLevelSplitsAndPersistence() {
     std::remove(path.c_str());
 }
 
+void testFreeListPersistenceAndReuse() {
+    const std::string path = testPath("free_list_persistence");
+    constexpr int kEntryCount = 192;
+    int allocatedPages = 0;
+    int persistedFreeHead = 0;
+
+    {
+        BPT* tree = createTree(path);
+        std::vector<Entry> entries;
+        char key[kKeySize];
+        for (int i = 0; i < kEntryCount; ++i) {
+            const int value = (i * 73) % 211;
+            const ull rid = RID(34, static_cast<unsigned>(i + 1));
+            writeKey(value, key);
+            require(tree->InsertEntry(key, rid) == 0,
+                    "free-list fixture insertion failed");
+            entries.emplace_back(value, rid);
+        }
+        require(validateTree(*tree) >= 4,
+                "free-list fixture did not create a deep tree");
+        allocatedPages = tree->meta.page;
+
+        std::sort(entries.begin(), entries.end(),
+                  [](const Entry& left, const Entry& right) {
+                      const ull leftGroup = left.second % 13;
+                      const ull rightGroup = right.second % 13;
+                      return leftGroup != rightGroup
+                                 ? leftGroup < rightGroup
+                                 : left.second < right.second;
+                  });
+        for (std::size_t i = 0; i < entries.size(); ++i) {
+            writeKey(entries[i].first, key);
+            require(tree->DeleteEntry(key, entries[i].second) == 0,
+                    "free-list fixture deletion failed");
+            if (i % 17 == 0) {
+                validateTree(*tree);
+            }
+        }
+
+        require(validateTree(*tree) == 1,
+                "empty tree did not contract to a leaf before reopen");
+        require(tree->meta.page == allocatedPages,
+                "deleting entries unexpectedly changed the high-water page count");
+        require(tree->meta.freehead != 0,
+                "emptying a deep tree did not create a free-page list");
+        persistedFreeHead = tree->meta.freehead;
+        delete tree;
+    }
+
+    {
+        BPT reopened(const_cast<char*>(path.c_str()));
+        reopened.L = TEST_T;
+        reopened.I = TEST_I;
+        reopened.Lmin = (reopened.L + 1) / 2;
+        reopened.Imin = (reopened.I + 1) / 2;
+        require(reopened.meta.page == allocatedPages,
+                "page high-water mark was not restored after reopen");
+        require(reopened.meta.freehead == persistedFreeHead,
+                "free-list head was not restored after reopen");
+        require(validateTree(reopened) == 1,
+                "reopened empty tree is structurally invalid");
+
+        std::vector<Entry> rebuilt;
+        char key[kKeySize];
+        for (int i = 0; i < kEntryCount; ++i) {
+            const int value = (i * 73) % 211;
+            const ull rid = RID(35, static_cast<unsigned>(i + 1));
+            writeKey(value, key);
+            require(reopened.InsertEntry(key, rid) == 0,
+                    "insertion after restoring the free list failed");
+            rebuilt.emplace_back(value, rid);
+            if (i == TEST_T) {
+                require(reopened.meta.page == allocatedPages,
+                        "first split after reopen grew the file despite free pages");
+                require(reopened.meta.freehead != persistedFreeHead,
+                        "first split after reopen did not consume the free list");
+            }
+        }
+        require(validateTree(reopened) >= 4,
+                "tree rebuilt from persisted free pages is not deep enough");
+        require(reopened.meta.page <= allocatedPages,
+                "reopened tree allocated new pages instead of reusing free pages");
+        checkFullScan(reopened, rebuilt);
+    }
+
+    std::remove(path.c_str());
+}
+
 std::vector<ull> scanRange(BPT& tree, int lower, bool lowerInclusive,
                            int upper, bool upperInclusive) {
-    char lowerKey[sizeof(int)];
-    char upperKey[sizeof(int)];
+    char lowerKey[kKeySize];
+    char upperKey[kKeySize];
     writeKey(lower, lowerKey);
     writeKey(upper, upperKey);
-    SearchIter iter = tree.SearchRange(lowerKey, lowerInclusive);
+    SearchIter iter = tree.SearchRange(lowerKey, upperKey, lowerInclusive);
+    iter.inclusive = upperInclusive;
     std::vector<ull> result;
-    for (;;) {
-        ull rid = 0;
-        if (!tree.Next(iter, upperKey, rid, upperInclusive)) {
-            break;
-        }
-        result.push_back(rid);
+    while (tree.Valid(iter)) {
+        result.push_back(iter.rec_rid);
         require(result.size() <= 100,
                 "range scan did not make progress or did not terminate");
+        tree.Next(iter);
     }
     return result;
 }
@@ -489,7 +1140,7 @@ std::vector<ull> scanRange(BPT& tree, int lower, bool lowerInclusive,
 void testRangeBoundaries() {
     const std::string path = testPath("ranges");
     BPT* tree = createTree(path);
-    char key[sizeof(int)];
+    char key[kKeySize];
     std::map<ull, int> values;
 
     for (int value = 1; value <= 9; ++value) {
@@ -528,6 +1179,29 @@ void testRangeBoundaries() {
     require(openBoth == expected({4, 5}),
             "open range returned the wrong entries");
 
+    require(scanRange(*tree, 8, true, 3, true).empty(),
+            "range with lower bound above upper bound was not empty");
+    require(scanRange(*tree, -100, true, -50, true).empty(),
+            "range entirely below the minimum key was not empty");
+    require(scanRange(*tree, 50, true, 100, true).empty(),
+            "range entirely above the maximum key was not empty");
+    require(scanRange(*tree, 5, true, 5, true) == expected({5}),
+            "closed singleton range returned the wrong entries");
+    require(scanRange(*tree, 5, false, 5, true).empty() &&
+                scanRange(*tree, 5, true, 5, false).empty() &&
+                scanRange(*tree, 5, false, 5, false).empty(),
+            "open singleton range was not empty");
+
+    // Exercise Next's own upper-bound guard even when the caller does not
+    // invoke Valid before advancing an already out-of-range cursor.
+    char low[kKeySize];
+    char high[kKeySize];
+    writeKey(8, low);
+    writeKey(3, high);
+    SearchIter invalid = tree->SearchRange(low, high, true);
+    require(!tree->Next(invalid) && !tree->Valid(invalid),
+            "Next did not stop an already out-of-range cursor");
+
     delete tree;
     std::remove(path.c_str());
 }
@@ -539,7 +1213,7 @@ void testDuplicateRangeBoundaries() {
         {3, RID(15, 8)}, {3, RID(15, 2)}, {3, RID(15, 5)},
         {4, RID(15, 7)}, {4, RID(15, 1)}, {5, RID(15, 4)},
     };
-    char key[sizeof(int)];
+    char key[kKeySize];
     for (const Entry& entry : inserted) {
         writeKey(entry.first, key);
         require(tree->InsertEntry(key, entry.second) == 0,
@@ -566,7 +1240,7 @@ void testManyDuplicatesAcrossLeaves() {
     const std::string path = testPath("many_duplicates");
     BPT* tree = createTree(path);
     std::vector<Entry> model;
-    char key[sizeof(int)];
+    char key[kKeySize];
 
     for (unsigned ridNumber = 1; ridNumber <= 37; ++ridNumber) {
         const Entry entry{42, RID(20, ridNumber)};
@@ -598,16 +1272,15 @@ void testManyDuplicatesAcrossLeaves() {
         }
         return result;
     }();
-    char lower[sizeof(int)];
-    char upper[sizeof(int)];
+    char lower[kKeySize];
+    char upper[kKeySize];
     writeKey(42, lower);
     writeKey(42, upper);
-    SearchIter iter = tree->SearchRange(lower, true);
+    SearchIter iter = tree->SearchRange(lower, upper, true);
     std::vector<ull> actual;
-    for (;;) {
-        ull rid = 0;
-        if (!tree->Next(iter, upper, rid, true)) break;
-        actual.push_back(rid);
+    while (tree->Valid(iter)) {
+        actual.push_back(iter.rec_rid);
+        tree->Next(iter);
     }
     require(actual == expected,
             "range scan lost or duplicated entries spanning duplicate-key leaves");
@@ -620,7 +1293,7 @@ void testDeleteAndRebalance() {
     const std::string path = testPath("delete_rebalance");
     BPT* tree = createTree(path);
     std::vector<Entry> remaining;
-    char key[sizeof(int)];
+    char key[kKeySize];
 
     for (int value = 0; value < 48; ++value) {
         const Entry entry{value, RID(16, static_cast<unsigned>(value + 1))};
@@ -663,7 +1336,7 @@ void testDeterministicMixedOperations() {
     const std::string path = testPath("mixed_operations");
     BPT* tree = createTree(path);
     std::vector<Entry> model;
-    char key[sizeof(int)];
+    char key[kKeySize];
     unsigned state = 0x13579bdfU;
     unsigned nextRid = 1;
 
@@ -710,7 +1383,7 @@ void testFourLevelBoundaryOperations() {
     const std::string path = testPath("four_level_boundaries");
     BPT* tree = createTree(path);
     std::vector<Entry> model;
-    char key[sizeof(int)];
+    char key[kKeySize];
     unsigned ridNumber = 1;
 
     auto insertValue = [&](int value) {
@@ -849,7 +1522,7 @@ void testSplitInsertionOrders() {
         }
 
         std::vector<Entry> model;
-        char key[sizeof(int)];
+        char key[kKeySize];
         unsigned ridNumber = 1;
         for (int value : values) {
             const Entry entry{value, RID(22 + static_cast<unsigned>(pattern),
@@ -882,7 +1555,7 @@ void testLongRandomizedRebalance() {
     const std::string path = testPath("long_random_rebalance");
     BPT* tree = createTree(path);
     std::vector<Entry> model;
-    char key[sizeof(int)];
+    char key[kKeySize];
     unsigned state = 0x7f4a7c15U;
     unsigned ridNumber = 1;
 
@@ -936,11 +1609,11 @@ bool runIsolated(const TestCase& test) {
         MyBitMap::initConst();
         try {
             test.run();
-            std::_Exit(0);
+            std::exit(0);
         } catch (const std::exception& error) {
             std::cerr << error.what() << '\n';
             std::cerr.flush();
-            std::_Exit(1);
+            std::exit(1);
         }
     }
     if (child < 0) {
@@ -974,9 +1647,23 @@ int main() {
         {"duplicate and exact duplicate", testDuplicateAndExactDuplicate},
         {"exact duplicate at search boundaries", testExactDuplicateAtSearchBoundaries},
         {"unique index", testUniqueIndex},
+        {"NULL keys across leaves and persistence",
+         testNullKeysAcrossLeavesAndPersistence},
+        {"unique index allows NULL keys", testUniqueAllowsNullKeys},
+        {"composite unique NULL semantics", testCompositeUniqueNullSemantics},
+        {"NULL bitmap across byte boundary", testNullBitmapAcrossByteBoundary},
+        {"FLOAT key ordering and ranges", testFloatKeyOrderingAndRanges},
+        {"VARCHAR key ordering and ranges", testVarcharKeyOrderingAndRanges},
+        {"odd node capacities", testOddNodeCapacities},
+        {"minimum leaf capacity", testMinimumLeafCapacity},
+        {"minimum internal capacity", testMinimumInternalCapacity},
+        {"minimum leaf and internal capacity",
+         testMinimumLeafAndInternalCapacity},
         {"multi-level splits and persistence", testMultiLevelSplitsAndPersistence},
+        {"free-list persistence and reuse", testFreeListPersistenceAndReuse},
         {"range boundaries", testRangeBoundaries},
         {"duplicate range boundaries", testDuplicateRangeBoundaries},
+        {"many duplicate keys across leaves", testManyDuplicatesAcrossLeaves},
         {"delete and rebalance", testDeleteAndRebalance},
         {"deterministic mixed operations", testDeterministicMixedOperations},
         {"four-level boundary operations", testFourLevelBoundaryOperations},
