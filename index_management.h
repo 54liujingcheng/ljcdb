@@ -152,7 +152,7 @@ struct BPT{
         bpm->markDirty(index);
         return ;
     }
-    #ifdef TEST
+    #ifdef TEST_OLD
     FileManager* fm;
     BPT(char* path){
         fm = new FileManager();
@@ -242,14 +242,6 @@ struct BPT{
         Lmin = (L+1)/2, Imin = (I+1)/2;
         AllocPage(0);
     }
-    #ifdef TEST
-    ~BPT(){
-        bpm->close();
-        fm->closeFile(fid);
-        delete bpm;
-        delete fm;
-    }
-    #endif
     int cmp(char* l,char* r,ull lrid,ull rrid){
         //l<r -1 = 0 > 1
         for(int i=0;i<meta.col;i++){

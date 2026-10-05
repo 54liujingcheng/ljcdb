@@ -64,7 +64,7 @@ struct RecordManager{
     int slotcapa;
     BufPageManager* bpm;
     TableMeta tbmeta;
-    #ifdef TEST
+    #ifdef TEST_OLD
     FileManager* fm;
     RecordManager(char* path, Schema& sch){
         fm = new FileManager();
@@ -118,14 +118,6 @@ struct RecordManager{
         memcpy(tbmetapage,&tbmeta,sizeof(TableMeta));
         bpm->markDirty(index);
     }
-    #ifdef TEST
-    ~RecordManager(){
-        bpm->close();
-        fm->closeFile(fid);
-        delete bpm;
-        delete fm;
-    }
-    #endif
     void LoadRecord(ull rid, char* dest){
         int pid=PID(rid),sid=SID(rid);
         int index, recordsize = tbmeta.schema.recordsize;
@@ -250,5 +242,18 @@ struct RecordManager{
             }
         }
         return RID(0,0);
+    }
+    bool isValid(ull rid){
+        int index,pid = PID(rid);int sid = SID(rid);
+        if (pid < 1 || pid > tbmeta.page)
+            return false;
+        if (sid < 0 || sid >= slotcapa)
+            return false;
+        BufType b = bpm->getPage(fid,pid,index);
+        uchar* bitmap = ((uchar*)b)+12;
+        if((bitmap[sid>>3] & (1<<(sid&0b111))) != 0){
+                return 1;
+        }
+        else return 0;
     }
 };
