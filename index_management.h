@@ -258,7 +258,7 @@ struct BPT{
             }
             //比较时NULL比所有非NULL值小
             int idx=meta.offset[i];
-            if(meta.type[i]==0){//int
+            if(meta.type[i]==0 || meta.type[i]==3){//int or date
                 int ll,rr;
                 memcpy(&ll,l+idx,sizeof(ll));
                 memcpy(&rr,r+idx,sizeof(rr));
@@ -270,7 +270,7 @@ struct BPT{
                 memcpy(&rr,r+idx,sizeof(rr));
                 if(ll<rr)return -1;else if(ll>rr)return 1;
             }
-            else{//varchar
+            else if(meta.type[i]==2){//varchar
                 for(int j=idx;j<meta.offset[i+1];j++){
                     if((uchar)l[j]<(uchar)r[j])return -1;
                     else if((uchar)l[j]>(uchar)r[j])return 1;

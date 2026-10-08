@@ -37,7 +37,7 @@ schema
 */
 struct Col{
     char name[MAX_STR];
-    int type;//0:INT 1:FLOAT 2:VARCHAR
+    int type;//0:INT 1:FLOAT 2:VARCHAR 3:DATE
     int len;
     int nullable;
     int defalutable;

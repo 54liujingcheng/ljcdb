@@ -11,11 +11,19 @@
 #include <unordered_set>
 #include <memory>
 #include <variant>
+#include <compare>
 #define MAX_TBL 16
 #define MAX_IDX 64
 #define MAX_FK 32
 #pragma once
 namespace fs = std::filesystem;
+enum Errortype{
+    OK, ERR_DUPULICATE, ERR_FORIEGN, ERR_PRIMARY, ERR_DATE, ERR_NULL, ERR_ELSE
+};
+struct DATE{
+    int date;
+    auto operator<=>(const DATE&) const = default;
+};
 struct PairHash {
     std::size_t operator()(const std::pair<int, std::string>& p) const {
         std::size_t h1 = std::hash<int>{}(p.first);
@@ -23,70 +31,16 @@ struct PairHash {
         return h1 ^ (h2 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2));
     }
 };
-typedef vector<variant<int,double,string,bool>> Row;
-inline int serialization(Row src, char* dest, Schema& sc){
-    memset(dest,0,sc.recordsize);
-    int nullen = sc.nullen, col = sc.col, j = nullen;
-    int nullbm = 0;
-    for(int i=0;i<col;i++){
-        Col& desc = sc.desc[i];
-        if(holds_alternative<bool>(src[i])){
-            dest[i >> 3] |= 1u << (i&7);
-        }
-        else{
-            dest[i >> 3] &= ~(1u << (i&7));
-            if(desc.type == 0 && holds_alternative<int>(src[i])){
-                memcpy(dest+j,&(get<int>(src[i])),desc.len);
-            }else if(desc.type == 1 && holds_alternative<double>(src[i])){
-                memcpy(dest+j,&(get<double>(src[i])),desc.len);
-            }else if(desc.type == 2 && holds_alternative<string>(src[i])){
-                string tmp = get<string>(src[i]);
-                if (tmp.size() > static_cast<size_t>(desc.len))
-                    return -1;
-                size_t tmplen = tmp.size();
-                tmp.copy(dest+j,tmplen,0);
-                memset(dest+j+tmplen,0,desc.len-tmplen);
-            }
-            else return -1;
-        }
-        j += desc.len;
-    }
-    return 0;
-}
-inline int deserialization(char* src, Row& dest, Schema& sc){
-    int nullen = sc.nullen, col = sc.col, j = nullen;
-    dest.clear();
-    for(int i=0;i<col;i++){
-        Col& desc = sc.desc[i];
-        if(src[i>>3] & (1u<<(i&7))){
-            bool tmp=false;
-            dest.push_back(tmp);
-        }
-        else{
-            if(desc.type == 0){
-                int tmp;
-                memcpy(&tmp, src+j, desc.len);
-                dest.push_back(tmp);
-            }else if(desc.type == 1){
-                double tmp;
-                memcpy(&tmp, src+j, desc.len);
-                dest.push_back(tmp);
-            }else{
-                size_t len = strnlen(src + j, desc.len);
-                string tmp(src + j, len);
-                dest.push_back(tmp);
-            }
-        }
-        j += desc.len;
-    }
-    return 0;
-}
+typedef vector<variant<int,double,string,bool,DATE>> Row;
+int serialization(Row& src, char* dest, Schema& sc);
+int deserialization(char* src, Row& dest, Schema& sc);
 struct Table{
     int id;
     char name[MAX_STR];
     unique_ptr<RecordManager> mng;
     string file_name;
     int pkid=-1;
+    unordered_map <string, int> name_cid;
     //int Insert(Row row, )
 };
 struct Index{
@@ -208,6 +162,7 @@ struct DbManager{
             if(tablebm.test(i))fprintf(f,"%d %s\n",table[i].id,table[i].name);
             table[i].mng.reset();
             table[i].pkid = -1;
+            table[i].name_cid.clear();
         }
         fclose(f);
         f = std::fopen(index.c_str(),"w");
@@ -290,6 +245,10 @@ struct DbManager{
             name_table[table[i].name] = table+i;
             id_table[table[i].id] = table+i;
             tablebm.set(i,1);
+            Schema& sc = table[i].mng->tbmeta.schema;
+            for(int j=0;j<sc.col;j++){
+                table[i].name_cid[sc.desc[j].name] = j;
+            }
         }
         fclose(f);
         f = fopen(index.c_str(),"r");
@@ -370,6 +329,10 @@ struct DbManager{
         table_num++;
         id_table[tb->id] = tb;
         name_table[name] = tb;
+        tb->name_cid.clear();
+        for(int i=0;i<sc.col;i++){
+            tb->name_cid[sc.desc[i].name] = i;
+        }
         return tb;
     }
     void DropTable(char* name){
@@ -400,6 +363,7 @@ struct DbManager{
         tablebm.reset(tb-table);
         name_table.erase(name);
         id_table.erase(id);
+        tb->name_cid.clear();
     }
     Index* CreateIndex(char* tablename, char* indexname, int col, vector<int>& cid, int unique, int implicit, int type){
         if(!name_table.count(tablename) || col!=cid.size() || col<=0)return 0;
@@ -622,12 +586,14 @@ struct DbManager{
                 DropIndex(table_name, id_idx[fkey->ch_idx_id]->name);
         }
     }
-    void ReadRow(string table_name, ull rid, Row& row){
-        if(!name_table.count(table_name))return ;
+    Row ReadRow(string table_name, ull rid){
+        Row row;
+        if(!name_table.count(table_name))return row;
         Table* tb = name_table[table_name];
-        if(!tb->mng->isValid(rid))return ;
+        if(!tb->mng->isValid(rid))return row;
         tb->mng->LoadRecord(rid,buf);
         deserialization(buf,row,tb->mng->tbmeta.schema);
+        return row;
     }
     void IntoIndexKey(char* src, char* dest, Schema& sc, vector<int>& cid){
         int j=(cid.size()+7)/8;
@@ -640,37 +606,38 @@ struct DbManager{
         }
     }
     ull InsertRow(string table_name,Row& row){
-        if(!name_table.count(table_name))return 1;
+        if(!name_table.count(table_name))return ERR_ELSE;
         Table* tb = name_table[table_name];
         Schema& sc = tb->mng->tbmeta.schema;
         vector<Index*> indexes;
         int recsize = sc.recordsize,col = row.size();
-        if(row.size()!=sc.col)return 2;
-        if(serialization(row,buf,sc) == -1)return 3;
+        if(row.size()!=sc.col)return ERR_ELSE;
+        if(serialization(row,buf,sc) == -1)return ERR_ELSE;
         for(int i=0;i<sc.col;i++){
             if(KeyColumnIsNull(buf,i)){
-                if((bool)(sc.desc[i].nullable) == 0)return 4;
+                if((bool)(sc.desc[i].nullable) == 0)return ERR_NULL;
                 continue;
             }
             if(sc.desc[i].type == 0 && !holds_alternative<int>(row[i])
             || sc.desc[i].type == 1 && !holds_alternative<double>(row[i])
             || sc.desc[i].type == 2 && !holds_alternative<string>(row[i])
-                )return 2;
+            || sc.desc[i].type == 3 && !holds_alternative<DATE>(row[i])
+                )return ERR_ELSE;
         }
         Index* primary ;
         if(tb->pkid != -1){
             primary = id_idx[tb->pkid];
             IntoIndexKey(buf,buf+recsize,sc,primary->cid);
             indexes.push_back(primary);
-            if(KeyHasNull(buf+recsize, primary->col))return 5;
-            if(primary->mng->Exist(buf+recsize))return 6;
+            if(KeyHasNull(buf+recsize, primary->col))return ERR_PRIMARY;
+            if(primary->mng->Exist(buf+recsize))return ERR_PRIMARY;
         }
         vector<Index*>& norm = id_normidx[tb->id];
         for(int i=0;i<norm.size();i++){
             Index* normidx = norm[i];
             indexes.push_back(norm[i]);
             IntoIndexKey(buf,buf+recsize,sc,normidx->cid);
-            if(normidx->uni&&!KeyHasNull(buf+recsize,normidx->col)&&normidx->mng->Exist(buf+recsize))return 7;
+            if(normidx->uni&&!KeyHasNull(buf+recsize,normidx->col)&&normidx->mng->Exist(buf+recsize))return ERR_DUPULICATE;
         }
         vector<Foreign*>& localfk = id_outfk[tb->id];
         for(int i=0;i<localfk.size();i++){
@@ -678,7 +645,7 @@ struct DbManager{
             Index* childidx = id_idx[fkey->ch_idx_id];
             IntoIndexKey(buf,buf+recsize,sc,childidx->cid);
             Index* parentidx = id_idx.at(fkey->pa_idx_id);
-            if (!KeyHasNull(buf+recsize, childidx->col) &&!parentidx->mng->Exist(buf+recsize))return 8;
+            if (!KeyHasNull(buf+recsize, childidx->col) &&!parentidx->mng->Exist(buf+recsize))return ERR_FORIEGN;
         }
         ull rid = tb->mng->InsertRecord(buf);
         if(rid<=0)return 9;
@@ -692,19 +659,19 @@ struct DbManager{
                     (*it)->mng->DeleteEntry(buf + recsize, rid);
                 }
                 tb->mng->EraseRecord(rid);
-                return 10;
+                return ERR_DUPULICATE;
             }
             insertedIndexes.push_back(index);
         }
         return rid;
     }
-    int ApplyDeleteRow(string table_name, ull rid){
-        if(!name_table.count(table_name))return 1;
+    int DeleteRow(string table_name, ull rid){
+        if(!name_table.count(table_name))return ERR_ELSE;
         Table* tb = name_table[table_name];
         Schema& sc = tb->mng->tbmeta.schema;
         vector<Index*> indexes;
         int recsize = sc.recordsize;
-        if(!tb->mng->isValid(rid))return 2;
+        if(!tb->mng->isValid(rid))return ERR_ELSE;
         if(id_infk.count(tb->id) && !id_infk[tb->id].empty()){
             vector<Foreign*>& in = id_infk[tb->id];
             for(auto fk:in){
@@ -712,7 +679,7 @@ struct DbManager{
                 Index* paidx = id_idx[fk->pa_idx_id];
                 tb->mng->LoadRecord(rid,buf);
                 IntoIndexKey(buf,buf+recsize,sc,paidx->cid);
-                if(chidx->mng->Exist(buf+recsize))return 3;
+                if(chidx->mng->Exist(buf+recsize))return ERR_FORIEGN;
             }
         }
         vector<Index*> deletedindexes;
@@ -738,12 +705,12 @@ struct DbManager{
                     IntoIndexKey(buf, buf + recsize, sc, (*it)->cid);
                     (*it)->mng->InsertEntry(buf + recsize, rid);
                 }
-                return 4;
+                return ERR_ELSE;
             }
             deletedindexes.push_back(index);
         }
         tb->mng->EraseRecord(rid);
-        return 0;
+        return OK;
     }
     #ifdef TEST
     int DeleteRows(string table_name, vector<ull>& vec){
@@ -790,15 +757,15 @@ struct DbManager{
         return 0;
     }
     #endif
-    int UpdateRow(string table_name, ull rid, vector<int> cid, Row row, bool& changed){
+    int UpdateRow(string table_name, ull rid, vector<int>& cid, Row& row, bool& changed){
         changed = false;
-        if(!name_table.count(table_name))return 1;
+        if(!name_table.count(table_name))return ERR_ELSE;
         Table* tb = name_table[table_name];
         Schema& sc = tb->mng->tbmeta.schema;
-        if (!tb->mng->isValid(rid))return 2;
-        if (cid.size() != row.size())return 3;
+        if (!tb->mng->isValid(rid))return ERR_ELSE;
+        if (cid.size() != row.size())return ERR_ELSE;
         for(size_t i=0;i<cid.size();i++){
-            if(cid[i]<0 || cid[i]>=sc.col)return 3;
+            if(cid[i]<0 || cid[i]>=sc.col)return ERR_ELSE;
         }
         int recsize = sc.recordsize;
         char* oldRecord = buf, *newRecord = buf+recsize;
@@ -809,14 +776,14 @@ struct DbManager{
         for(size_t i=0;i<cid.size();i++){
             newRow[cid[i]]=row[i];
         }
-        if(serialization(newRow, newRecord, sc))return 4;
+        if(serialization(newRow, newRecord, sc))return ERR_ELSE;
         for (int i = 0; i < sc.col; i++) {
             if (KeyColumnIsNull(newRecord, i) && !sc.desc[i].nullable) {
-                return 5;
+                return ERR_NULL;
             }
         }
         if (memcmp(oldRecord, newRecord, recsize) == 0) {
-            return 0;
+            return OK;
         }
         vector<Index*> indexes;
         if(tb->pkid!=-1)indexes.push_back(id_idx.at(tb->pkid));
@@ -826,11 +793,11 @@ struct DbManager{
         for(Index* index:indexes){
             IntoIndexKey(oldRecord,oldKey,sc,index->cid);
             IntoIndexKey(newRecord,newKey,sc,index->cid);
-            if(index->type==0 && KeyHasNull(newKey,index->col))return 5;
+            if(index->type==0 && KeyHasNull(newKey,index->col))return ERR_PRIMARY;
             if(index->mng->cmp(oldKey,newKey,0,0)==0)continue;
-            if(index->type==0 && index->mng->Exist(newKey))return 6;
+            if(index->type==0 && index->mng->Exist(newKey))return ERR_DUPULICATE;
             if(index->type!=0 && index->uni &&
-               !KeyHasNull(newKey,index->col) && index->mng->Exist(newKey))return 7;
+               !KeyHasNull(newKey,index->col) && index->mng->Exist(newKey))return ERR_DUPULICATE;
         }
         if(id_outfk.count(tb->id)){
             for(Foreign* foreign:id_outfk[tb->id]){
@@ -845,7 +812,7 @@ struct DbManager{
                     IntoIndexKey(newRecord,oldKey,sc,parentIndex->cid);
                     if(parentIndex->mng->cmp(oldKey,newKey,0,0)==0)continue;
                 }
-                return 8;
+                return OK;
             }
         }
         if(id_infk.count(tb->id)){
@@ -863,7 +830,7 @@ struct DbManager{
                         remainsReferenced = !KeyHasNull(newKey,childIndex->col) &&
                             childIndex->mng->cmp(newKey,oldKey,0,0)==0;
                     }
-                    if(remainsReferenced)return 9;
+                    if(remainsReferenced)return ERR_FORIEGN;
                     if(!childIndex->mng->Next(iter))break;
                 }
             }
@@ -882,13 +849,13 @@ struct DbManager{
                     (*it)->mng->InsertEntry(oldKey,rid);
                     (*it)->mng->DeleteEntry(newKey,rid);
                 }
-                return 10;
+                return ERR_ELSE;
             }
             updatedIndexes.push_back(index);
         }
         tb->mng->UpdataRecord(rid,newRecord);
         changed = true;
-        return 0;
+        return OK;
     }
 };
 /*
