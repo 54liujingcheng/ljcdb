@@ -72,6 +72,7 @@ struct Foreign{
     int ch_idx_id;
 };
 int index_serialization(Row& src, char* dest, Schema& sc, Index* idx);
+int index_deserialization(char* src, Row& dest, Schema& sc, Index* idx);
 struct DbManager{
     Table table[MAX_TBL];
     Index idx[MAX_IDX];

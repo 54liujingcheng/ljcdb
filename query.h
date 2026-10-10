@@ -432,9 +432,9 @@ struct BNLJ : Operator{
             left.is_val = i.left.is_val;
             right.is_val = i.right.is_val;
             if(left.is_val)left.val = i.left.val;
-            else left.slot = col_slot[i.left.col];
+            else left.slot = col_slot.at(i.left.col);
             if(right.is_val)right.val = i.right.val;
-            else right.slot = col_slot[i.right.col];
+            else right.slot = col_slot.at(i.right.col);
             conditions.push_back(tmp);
         }
         outer_idx = 0;
@@ -517,7 +517,7 @@ struct BNLJ : Operator{
                 else if(i.right.slot<outer_col)r=&outer_tuple.values[i.right.slot];
                 else r=&inner_tuple.values[i.right.slot-outer_col];
                 if(holds_alternative<bool>(*l) || holds_alternative<bool>(*r)){
-                    goto label;outer_idx++;
+                    goto label;
                 }
                 if(i.op == CompareOp::EQ && *l == *r || i.op == CompareOp::GE && *l >= *r 
                 || i.op == CompareOp::GT && *l > *r || i.op == CompareOp::LE && *l <= *r
@@ -1149,5 +1149,191 @@ struct Aggregate: Operator{
         }
         cur++;
         return 0;
+    }
+};
+struct INLJ: Operator{
+    unique_ptr<Operator> outer_child;
+    int inner_table_id;
+    Table* inner_table;
+    Index* inner_index;
+    Tuple outer_tuple;
+    Tuple inner_tuple;
+    Row key;
+    SearchIter iter;
+    char* record_buf;
+    char* key_buf;
+    int outer_col;
+    bool finished;
+    vector<ExeCondition> conditions;
+    vector<int> idxcid_outsid;
+    INLJ(DbManager* dbm, unique_ptr<Operator> _outer_child, Index* index, vector<Condition>& vec): Operator(dbm){
+        inner_index = index;
+        inner_table_id = inner_index->table_id;
+        inner_table = dbm->id_table[inner_table_id];
+        outer_child = move(_outer_child);
+        layout = outer_child->layout;
+        Schema& sc = inner_table->mng->tbmeta.schema;
+        col_slot = outer_child->col_slot;
+        outer_col = outer_child->layout.size();
+        idxcid_outsid.assign(index->cid.size(), -1);
+        for(int i=0;i<sc.col;i++){
+            BoundColumn tmp = {inner_table_id, i, sc.desc[i].type, sc.desc[i].nullable};
+            string print_name = string(inner_table->name) +"."+ string(sc.desc[i].name);
+            layout.push_back({print_name,tmp});
+            col_slot[tmp] = i + outer_col;
+        }
+        for (int key_pos = 0;key_pos < inner_index->cid.size();++key_pos) {
+            const int inner_cid = inner_index->cid[key_pos];
+            for (const Condition& condition : vec) {
+                if (condition.type != ConditionType::COMPARE ||
+                    condition.op != CompareOp::EQ ||
+                    condition.left.is_val ||
+                    condition.right.is_val) {
+                    continue;
+                }
+                const BoundColumn* outer_column = nullptr;
+                if (condition.left.col.table_id == inner_table_id &&
+                    condition.left.col.cid == inner_cid) {
+                    outer_column = &condition.right.col;
+                }
+                else if (condition.right.col.table_id == inner_table_id &&
+                        condition.right.col.cid == inner_cid) {
+                    outer_column = &condition.left.col;
+                }
+                if (outer_column == nullptr) {
+                    continue;
+                }
+                auto slot_it = outer_child->col_slot.find(*outer_column);
+                if (slot_it == outer_child->col_slot.end()) {
+                    continue;
+                }
+                idxcid_outsid[key_pos] = slot_it->second;
+                break;
+            }
+        }
+        for(auto i:vec){
+            ExeCondition tmp;
+            tmp.op = i.op, tmp.pattern = i.pattern, tmp.type = i.type, tmp.values = i.values;
+            ExeOperand& left = tmp.left,&right = tmp.right;
+            left.is_val = i.left.is_val;
+            right.is_val = i.right.is_val;
+            if(left.is_val)left.val = i.left.val;
+            else left.slot = col_slot.at(i.left.col);
+            if(right.is_val)right.val = i.right.val;
+            else right.slot = col_slot.at(i.right.col);
+            conditions.push_back(tmp);
+        }
+        finished = 0;
+        record_buf = new char[sc.recordsize];
+        key_buf = new char[inner_index->mng->keylen];
+        key.reserve(inner_index->col);
+        inner_tuple.values.reserve(sc.col);
+    }
+    ~INLJ(){
+        delete[] key_buf;
+        delete[] record_buf;
+    }
+    int Open(){
+        iter = {};
+        if(outer_child->Open()){
+            opened = 0;
+            return -1;
+        }
+        opened = 1;
+        finished = 0;
+        return 0;
+    }
+    int Next(Tuple& output){
+        if(opened == false)return -1;
+        if(finished)return 1;
+        Schema& sc = inner_table->mng->tbmeta.schema;
+        label:
+        if(inner_index->mng->Valid(iter,1)){
+            ull rid = iter.rec_rid;
+            inner_index->mng->Next(iter);
+            inner_table->mng->LoadRecord(rid, record_buf);
+            deserialization(record_buf, inner_tuple.values, sc);
+        }else{
+            label2:
+            int res = outer_child->Next(outer_tuple);
+            if(res == -1)return -1;
+            if(res == 1){
+                finished = 1;
+                return 1;
+            }
+            key.clear();
+            for(auto i:idxcid_outsid){
+                key.push_back(outer_tuple.values[i]);
+                if(holds_alternative<bool>(outer_tuple.values[i])){
+                    key.clear();
+                    goto label2;
+                }
+            }
+            if(index_serialization(key, key_buf, sc, inner_index)){
+                return -1;
+            }
+            iter = inner_index->mng->SearchRange(key_buf, key_buf, 1, 1);
+            goto label;
+        }
+        for(auto& i:conditions){
+            if(i.type == ConditionType::COMPARE){
+                Value *l,*r;
+                if(i.left.is_val)l=&i.left.val;
+                else if(i.left.slot<outer_col)l=&outer_tuple.values[i.left.slot];
+                else l=&inner_tuple.values[i.left.slot-outer_col];
+                if(i.right.is_val)r=&i.right.val;
+                else if(i.right.slot<outer_col)r=&outer_tuple.values[i.right.slot];
+                else r=&inner_tuple.values[i.right.slot-outer_col];
+                if(holds_alternative<bool>(*l) || holds_alternative<bool>(*r)){
+                    goto label;
+                }
+                if(i.op == CompareOp::EQ && *l == *r || i.op == CompareOp::GE && *l >= *r 
+                || i.op == CompareOp::GT && *l > *r || i.op == CompareOp::LE && *l <= *r
+                || i.op == CompareOp::LT && *l < *r || i.op == CompareOp::NE && *l != *r)continue;
+                else goto label;
+            }
+            if(i.type == ConditionType::IN_LIST){
+                Value *l;
+                if(i.left.slot<outer_col)l=&outer_tuple.values[i.left.slot];
+                else l=&inner_tuple.values[i.left.slot-outer_col];
+                if(holds_alternative<bool>(*l))goto label;
+                if(find(i.values.begin(),i.values.end(),*l) != i.values.end())continue;
+                else goto label;
+            }
+            if(i.type == ConditionType::IS_NULL){
+                Value *l;
+                if(i.left.slot<outer_col)l=&outer_tuple.values[i.left.slot];
+                else l=&inner_tuple.values[i.left.slot-outer_col];
+                if(holds_alternative<bool>(*l))continue;
+                else goto label;
+            }
+            if(i.type == ConditionType::IS_NOT_NULL){
+                Value *l;
+                if(i.left.slot<outer_col)l=&outer_tuple.values[i.left.slot];
+                else l=&inner_tuple.values[i.left.slot-outer_col];
+                if(!holds_alternative<bool>(*l))continue;
+                else goto label;
+            }
+            if(i.type == ConditionType::LIKE){
+                Value *l;
+                if(i.left.slot<outer_col)l=&outer_tuple.values[i.left.slot];
+                else l=&inner_tuple.values[i.left.slot-outer_col];
+                if(holds_alternative<bool>(*l))goto label;
+                if(like(get<string>(*l),i.pattern))continue;
+                else goto label;
+            }
+        }
+        output.values = outer_tuple.values;
+        output.values.insert(output.values.end(), inner_tuple.values.begin(), inner_tuple.values.end());
+        return 0;
+    }
+    void Close() {
+        outer_child->Close();
+        iter = {};
+        key.clear();
+        outer_tuple.values.clear();
+        inner_tuple.values.clear();
+        finished = false;
+        opened = false;
     }
 };

@@ -361,11 +361,15 @@ struct BPT{
         }
         return false;
     }
-    bool Valid(const SearchIter& i) {
+    bool Valid(SearchIter& i, bool INLT = false) {
         if (i.curpid == 0 || i.key == nullptr)
             return false;
         if (i.r == nullptr)
             return true;
+        if(INLT){
+            int index;
+            i.key = LEAFENTRY(bpm->getPage(fid,i.curpid,index), i.cursid);
+        }
         int order = cmp(i.key, i.r, 0, 0);
         return order < 0 || (order == 0 && i.rinclusive);
     }

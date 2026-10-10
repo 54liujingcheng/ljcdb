@@ -533,6 +533,36 @@ inline bool like(std::string_view text, std::string_view pattern) {
     return p_idx == pattern.length();
 }
 unique_ptr<Operator> ScanMother(DbManager* dbm, vector<Condition>& conditions, int table_id);
+static bool CanUseINLJ(Index* idx,int inner_table_id,const Operator& outer,const vector<Condition>& join_conditions) {
+    for (int inner_cid : idx->cid) {
+        bool found = false;
+        for (const Condition& condition : join_conditions) {
+            if (condition.type != ConditionType::COMPARE ||
+                condition.op != CompareOp::EQ ||
+                condition.left.is_val ||
+                condition.right.is_val) {
+                continue;
+            }
+            const BoundColumn* outer_column = nullptr;
+            if (condition.left.col.table_id == inner_table_id &&
+                condition.left.col.cid == inner_cid) {
+                outer_column = &condition.right.col;
+            }
+            else if (condition.right.col.table_id == inner_table_id &&
+                     condition.right.col.cid == inner_cid) {
+                outer_column = &condition.left.col;
+            }
+            if (outer_column != nullptr &&
+                outer.col_slot.find(*outer_column) != outer.col_slot.end()) {
+                found = true;
+                break;
+            }
+        }
+        if (!found)
+            return false;
+    }
+    return true;
+}
 unique_ptr<Operator> Planner(DbManager* dbm, BoundSelectRequest& bsr){//记得有聚合的时候不用Project
     if(bsr.errorcode!=0 || bsr.table_ids.empty())return nullptr;
     unique_ptr<Operator> root = nullptr;
@@ -625,7 +655,7 @@ unique_ptr<Operator> Planner(DbManager* dbm, BoundSelectRequest& bsr){//记得�
         }
         if(tmp.size()>0)root = make_unique<Filter>(dbm, move(root), tmp);
         tids.insert(i);
-        for(int ii=bsr.table_ids.size()-2;ii>=0;ii--){
+        /*for(int ii=bsr.table_ids.size()-2;ii>=0;ii--){
             int i = bsr.table_ids[ii];
             unique_ptr<Operator>tmptr = ScanMother(dbm, bsr.conditions, i);
             vector<Condition> tmp,tmp2;
@@ -646,6 +676,64 @@ unique_ptr<Operator> Planner(DbManager* dbm, BoundSelectRequest& bsr){//记得�
             tmp.clear();
             root = make_unique<BNLJ>(dbm, move(tmptr), move(root), tmp2);
             tids.insert(i);
+        }*/
+        for (int ii = bsr.table_ids.size()-2;ii >= 0;--ii) {
+            int inner_table_id = bsr.table_ids[ii];
+            vector<Condition> local_conditions;
+            vector<Condition> join_conditions;
+            for (auto& condition : bsr.conditions) {
+                if (condition.type == ConditionType::COMPARE) {
+                    if ((condition.left.is_val || condition.left.col.table_id == inner_table_id) &&
+                        (condition.right.is_val || condition.right.col.table_id == inner_table_id)) {
+                        local_conditions.push_back(condition);
+                    }
+                    else if (!condition.left.is_val &&!condition.right.is_val &&((condition.left.col.table_id == inner_table_id &&
+                            tids.count(condition.right.col.table_id)) || (condition.right.col.table_id == inner_table_id && tids.count(condition.left.col.table_id)))) {
+                        join_conditions.push_back(condition);
+                    }
+                }
+                else {
+                    if (!condition.left.is_val && condition.left.col.table_id == inner_table_id) {
+                        local_conditions.push_back(condition);
+                    }
+                }
+            }
+            Table* inner_table = dbm->id_table.at(inner_table_id);
+            Index* best_index = nullptr;
+            int best_score = -1;
+            auto consider_index = [&](Index* idx) {
+                if (!CanUseINLJ(idx, inner_table_id, *root, join_conditions))
+                    return;
+                int score = idx->col;
+                if (idx->uni)
+                    score += 1000;
+                if (score > best_score) {
+                    best_score = score;
+                    best_index = idx;
+                }
+            };
+            if (inner_table->pkid != -1) {
+                consider_index(dbm->id_idx.at(inner_table->pkid));
+            }
+            auto index_it = dbm->id_normidx.find(inner_table_id);
+            if (index_it != dbm->id_normidx.end()) {
+                for (Index* idx : index_it->second) {
+                    consider_index(idx);
+                }
+            }
+            if (best_index != nullptr) {
+                vector<Condition> inlj_conditions = join_conditions;
+                inlj_conditions.insert(inlj_conditions.end(),local_conditions.begin(),local_conditions.end());
+                root = make_unique<INLJ>(dbm, move(root), best_index, inlj_conditions);
+            }
+            else {
+                unique_ptr<Operator> inner_scan = ScanMother(dbm, bsr.conditions, inner_table_id);
+                if (!local_conditions.empty()) {
+                    inner_scan = make_unique<Filter>(dbm, move(inner_scan), local_conditions);
+                }
+                root = make_unique<BNLJ>(dbm, move(inner_scan), move(root), join_conditions);
+            }
+            tids.insert(inner_table_id);
         }
         bool flag=0;
         for(auto i:bsr.ORDERBY){

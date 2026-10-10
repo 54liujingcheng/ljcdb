@@ -91,3 +91,35 @@ int index_serialization(Row& src, char* dest, Schema& sc, Index* idx){
     }
     return 0;
 }
+int index_deserialization(char* src, Row& dest, Schema& sc, Index* idx){
+    int nullen = (idx->mng->meta.offset[0]), col = idx->col, j = nullen;
+    dest.clear();
+    for(int i=0;i<col;i++){
+        Col& desc = sc.desc[idx->cid[i]];
+        if(src[i>>3] & (1u<<(i&7))){
+            bool tmp=false;
+            dest.push_back(tmp);
+        }
+        else{
+            if(desc.type == 0){
+                int tmp;
+                memcpy(&tmp, src+j, desc.len);
+                dest.push_back(tmp);
+            }else if(desc.type == 1){
+                double tmp;
+                memcpy(&tmp, src+j, desc.len);
+                dest.push_back(tmp);
+            }else if(desc.type == 2){
+                size_t len = strnlen(src + j, desc.len);
+                string tmp(src + j, len);
+                dest.push_back(tmp);
+            }else if(desc.type == 3){
+                DATE tmp;
+                memcpy(&tmp, src+j, desc.len);
+                dest.push_back(tmp);
+            }
+        }
+        j += desc.len;
+    }
+    return 0;
+}
