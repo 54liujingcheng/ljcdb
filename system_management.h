@@ -24,6 +24,14 @@ struct DATE{
     int date;
     auto operator<=>(const DATE&) const = default;
 };
+namespace std {
+    template <>
+    struct hash<DATE> {
+        std::size_t operator()(const DATE& p) const noexcept {
+            return std::hash<int>{}(p.date);
+        }
+    };
+}
 struct PairHash {
     std::size_t operator()(const std::pair<int, std::string>& p) const {
         std::size_t h1 = std::hash<int>{}(p.first);
@@ -31,7 +39,7 @@ struct PairHash {
         return h1 ^ (h2 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2));
     }
 };
-typedef vector<variant<int,double,string,bool,DATE>> Row;
+typedef vector<variant<int,double,string,bool,DATE,long long>> Row;
 int serialization(Row& src, char* dest, Schema& sc);
 int deserialization(char* src, Row& dest, Schema& sc);
 struct Table{
@@ -63,6 +71,7 @@ struct Foreign{
     int pa_idx_id;
     int ch_idx_id;
 };
+int index_serialization(Row& src, char* dest, Schema& sc, Index* idx);
 struct DbManager{
     Table table[MAX_TBL];
     Index idx[MAX_IDX];
@@ -101,7 +110,7 @@ struct DbManager{
         opened_fid.clear();
         fm = new FileManager();
         idx_bpm = new BufPageManager(fm);
-        rec_bpm = new BufPageManager(fm);
+        rec_bpm = idx_bpm;
         buf = new char[PAGE_SIZE];
         dbname.clear();
     }
@@ -109,7 +118,6 @@ struct DbManager{
         CloseDb();
         delete[] buf;
         delete idx_bpm;
-        delete rec_bpm;
         delete fm;
     }
     bool OpenFile(const std::string& path, int& fid) {
@@ -812,7 +820,7 @@ struct DbManager{
                     IntoIndexKey(newRecord,oldKey,sc,parentIndex->cid);
                     if(parentIndex->mng->cmp(oldKey,newKey,0,0)==0)continue;
                 }
-                return OK;
+                return ERR_FORIEGN;
             }
         }
         if(id_infk.count(tb->id)){

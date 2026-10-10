@@ -134,8 +134,7 @@ int recordCount(Table* table) {
 
 void expectIntRow(DbManager& manager, const char* tableName, ull rid,
                   const Row& expected) {
-    Row actual;
-    manager.ReadRow(tableName, rid, actual);
+    Row actual = manager.ReadRow(tableName, rid);
     require(actual == expected, "ReadRow returned an unexpected row");
 }
 
@@ -209,12 +208,10 @@ void testRowValidationAndReadback() {
     require(recordCount(table) == 1,
             "invalid rows changed the table contents");
 
-    Row missing;
-    manager.ReadRow("rows", RID(999999, 999999), missing);
+    Row missing = manager.ReadRow("rows", RID(999999, 999999));
     require(missing.empty(), "invalid ReadRow unexpectedly produced data");
-    std::vector<ull> invalid{RID(999999, 999999)};
-    require(manager.DeleteRows("rows", invalid) == 3,
-            "DeleteRows accepted an invalid RID");
+    require(manager.DeleteRow("rows", RID(999999, 999999)) == ERR_ELSE,
+            "DeleteRow accepted an invalid RID");
 }
 
 void testPrimaryKeyInsertionRules() {
@@ -231,9 +228,9 @@ void testPrimaryKeyInsertionRules() {
     Row nullValue{false};
     require(successfulRid(manager.InsertRow("items", first)),
             "first primary-key value was rejected");
-    require(manager.InsertRow("items", duplicate) == 3,
+    require(manager.InsertRow("items", duplicate) == ERR_PRIMARY,
             "duplicate primary-key value was not rejected");
-    require(manager.InsertRow("items", nullValue) == 8,
+    require(manager.InsertRow("items", nullValue) == ERR_PRIMARY,
             "NULL primary-key value was not rejected");
 }
 
@@ -293,7 +290,7 @@ void testUniqueNullSemantics() {
             "repeated second NULL shape was rejected");
     require(successfulRid(manager.InsertRow("values", concrete)),
             "first concrete UNIQUE key was rejected");
-    require(manager.InsertRow("values", concrete) == 4,
+    require(manager.InsertRow("values", concrete) == ERR_DUPULICATE,
             "duplicate concrete UNIQUE key was accepted");
     require(recordCount(table) == 5,
             "UNIQUE NULL semantics produced the wrong record count");
@@ -364,8 +361,7 @@ void testForeignInsertAndDeleteRules() {
         mutableString("fk_parent"), parent->id, child->id, childColumns);
     require(foreign != nullptr, "foreign-key creation failed");
 
-    std::vector<ull> unreferencedParent{parentEightRid};
-    require(manager.DeleteRows("parent", unreferencedParent) == 0,
+    require(manager.DeleteRow("parent", parentEightRid) == OK,
             "unreferenced parent row could not be deleted");
 
     Row validChild{123, 7};
@@ -373,19 +369,17 @@ void testForeignInsertAndDeleteRules() {
     Row nullChild{125, false};
     const ull childRid = manager.InsertRow("child", validChild);
     require(successfulRid(childRid), "valid child row was rejected");
-    require(manager.InsertRow("child", invalidChild) == 5,
+    require(manager.InsertRow("child", invalidChild) == ERR_FORIEGN,
             "child row with a missing parent was accepted");
     require(successfulRid(manager.InsertRow("child", nullChild)),
             "NULL foreign-key row was rejected");
 
-    std::vector<ull> referencedParent{parentSevenRid};
-    require(manager.DeleteRows("parent", referencedParent) == 2,
+    require(manager.DeleteRow("parent", parentSevenRid) == ERR_FORIEGN,
             "referenced parent row was deleted");
 
-    std::vector<ull> childRows{childRid};
-    require(manager.DeleteRows("child", childRows) == 0,
+    require(manager.DeleteRow("child", childRid) == OK,
             "child row could not be deleted");
-    require(manager.DeleteRows("parent", referencedParent) == 0,
+    require(manager.DeleteRow("parent", parentSevenRid) == OK,
             "parent remained blocked after its child row was deleted");
 }
 
@@ -515,14 +509,130 @@ void testIndexMaintenanceOnDelete() {
     require(secondary->mng->Exist(secondaryKey),
             "secondary index missed inserted row");
 
-    std::vector<ull> rows{rid};
-    require(manager.DeleteRows("items", rows) == 0,
+    require(manager.DeleteRow("items", rid) == OK,
             "indexed row deletion failed");
     require(!primary->mng->Exist(primaryKey),
             "primary index retained a deleted row");
     require(!secondary->mng->Exist(secondaryKey),
             "secondary index retained a deleted row");
     require(recordCount(table) == 0, "deleted record remained in the table");
+}
+
+void testUpdateRowAndIndexMaintenance() {
+    TemporaryWorkspace workspace;
+    DbManager manager;
+    createAndUse(manager);
+    Schema schema = twoIntSchema("id", "value");
+    createTable(manager, "items", schema);
+    Index* primary = createIndex(manager, "items", "pk_items", {0}, 1, 1, 0);
+    Index* unique = createIndex(manager, "items", "uq_value", {1}, 1, 0, 1);
+    require(primary != nullptr && unique != nullptr,
+            "update index fixtures could not be created");
+
+    Row first{1, 10};
+    Row second{2, 20};
+    const ull firstRid = manager.InsertRow("items", first);
+    require(successfulRid(firstRid) &&
+                successfulRid(manager.InsertRow("items", second)),
+            "update fixture insertion failed");
+
+    std::vector<int> valueColumn{1};
+    Row fifteen{15};
+    bool changed = false;
+    require(manager.UpdateRow("items", firstRid, valueColumn, fifteen,
+                              changed) == OK &&
+                changed,
+            "ordinary indexed update failed");
+    expectIntRow(manager, "items", firstRid, {1, 15});
+
+    char oldKey[1 + sizeof(int)]{};
+    char newKey[1 + sizeof(int)]{};
+    const int oldValue = 10;
+    const int newValue = 15;
+    std::memcpy(oldKey + 1, &oldValue, sizeof(oldValue));
+    std::memcpy(newKey + 1, &newValue, sizeof(newValue));
+    require(!unique->mng->Exist(oldKey) && unique->mng->Exist(newKey),
+            "UpdateRow did not move the secondary-index entry");
+
+    changed = true;
+    require(manager.UpdateRow("items", firstRid, valueColumn, fifteen,
+                              changed) == OK &&
+                !changed,
+            "no-op update incorrectly reported a change");
+
+    Row duplicate{20};
+    changed = true;
+    require(manager.UpdateRow("items", firstRid, valueColumn, duplicate,
+                              changed) == ERR_DUPULICATE &&
+                !changed,
+            "UNIQUE-violating update was accepted");
+    expectIntRow(manager, "items", firstRid, {1, 15});
+    require(unique->mng->Exist(newKey),
+            "failed update damaged the existing secondary-index entry");
+
+    Row nullValue{false};
+    require(manager.UpdateRow("items", firstRid, valueColumn, nullValue,
+                              changed) == ERR_NULL,
+            "update put NULL into a NOT NULL column");
+}
+
+void testUpdateRowForeignKeyRules() {
+    TemporaryWorkspace workspace;
+    DbManager manager;
+    createAndUse(manager);
+    Schema parentSchema = oneIntSchema(false);
+    Schema childSchema = twoIntSchema("payload", "parent_id", true);
+    Table* parent = createTable(manager, "parent", parentSchema);
+    Table* child = createTable(manager, "child", childSchema);
+    require(createIndex(manager, "parent", "pk_parent", {0}, 1, 1, 0) !=
+                nullptr,
+            "foreign-update primary index creation failed");
+    std::vector<int> childForeignColumn{1};
+    require(manager.CreateForeign(mutableString("fk_parent"), parent->id,
+                                  child->id, childForeignColumn) != nullptr,
+            "foreign-update constraint creation failed");
+
+    Row seven{7};
+    Row eight{8};
+    const ull sevenRid = manager.InsertRow("parent", seven);
+    const ull eightRid = manager.InsertRow("parent", eight);
+    Row childRow{100, 7};
+    const ull childRid = manager.InsertRow("child", childRow);
+    require(successfulRid(sevenRid) && successfulRid(eightRid) &&
+                successfulRid(childRid),
+            "foreign-update fixture insertion failed");
+
+    bool changed = false;
+    Row existingParent{8};
+    require(manager.UpdateRow("child", childRid, childForeignColumn,
+                              existingParent, changed) == OK &&
+                changed,
+            "child foreign key could not be changed to an existing parent");
+    expectIntRow(manager, "child", childRid, {100, 8});
+
+    Row missingParent{999};
+    changed = true;
+    require(manager.UpdateRow("child", childRid, childForeignColumn,
+                              missingParent, changed) == ERR_FORIEGN &&
+                !changed,
+            "child foreign key was changed to a missing parent");
+    expectIntRow(manager, "child", childRid, {100, 8});
+
+    std::vector<int> parentKeyColumn{0};
+    Row newParentKey{9};
+    require(manager.UpdateRow("parent", eightRid, parentKeyColumn,
+                              newParentKey, changed) == ERR_FORIEGN,
+            "referenced parent key was updated");
+
+    Row nullForeign{false};
+    require(manager.UpdateRow("child", childRid, childForeignColumn,
+                              nullForeign, changed) == OK &&
+                changed,
+            "nullable child foreign key could not be set to NULL");
+    require(manager.UpdateRow("parent", eightRid, parentKeyColumn,
+                              newParentKey, changed) == OK &&
+                changed,
+            "unreferenced parent key remained blocked");
 }
 
 void testPersistenceAcrossCloseAndUse() {
@@ -564,9 +674,9 @@ void testPersistenceAcrossCloseAndUse() {
 
     Row duplicateParent{7, 100};
     Row orphanChild{124, 999};
-    require(manager.InsertRow("parent", duplicateParent) == 3,
+    require(manager.InsertRow("parent", duplicateParent) == ERR_PRIMARY,
             "reopened primary key did not reject a duplicate");
-    require(manager.InsertRow("child", orphanChild) == 5,
+    require(manager.InsertRow("child", orphanChild) == ERR_FORIEGN,
             "reopened foreign key did not reject an orphan");
 }
 
@@ -657,6 +767,8 @@ int main() {
         {"foreign name and shared implicit index", testForeignNameAndSharedImplicitIndex},
         {"foreign reuses explicit index", testForeignReusesAndPreservesExplicitIndex},
         {"index maintenance on delete", testIndexMaintenanceOnDelete},
+        {"UpdateRow and index maintenance", testUpdateRowAndIndexMaintenance},
+        {"UpdateRow foreign-key rules", testUpdateRowForeignKeyRules},
         {"persistence across close/use", testPersistenceAcrossCloseAndUse},
         {"maximum supported record and key", testMaximumSupportedRecordAndIndexKey},
     };

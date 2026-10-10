@@ -1,4 +1,8 @@
 #include "query.h"
+#include <compare>
+#include <tuple>
+#include <climits>
+#include <cfloat>
 std::optional<DATE> parse_date_yyyy_mm_dd(std::string_view str) {
     if (str.size() < 10) return std::nullopt;
     DATE d;
@@ -57,7 +61,7 @@ BoundInsertRequest BindingInsertRequest(DbManager& dbm,UnboundInsertRequest& req
     }
     return BoundInsertRequest{table_id, req.rows, 0};
 }
-pair<Condition, int> ConditionBindingHelper(Table* ltb,Table* rtb, UnboundCondition& i){
+pair<Condition, int> ConditionBindingHelper(Table* ltb,Table* rtb, UnboundCondition& i, DbManager& dbm){
     Schema& lsc = ltb->mng->tbmeta.schema;
     Schema& rsc = rtb->mng->tbmeta.schema;
     int ltable_id = ltb->id, rtable_id = rtb->id;
@@ -140,6 +144,14 @@ pair<Condition, int> ConditionBindingHelper(Table* ltb,Table* rtb, UnboundCondit
         tmp.left = {i.left.is_val, ttmp, i.left.val};
         if(tmp.type == ConditionType::LIKE && tmp.left.col.type != 2)return {tmp, ERR_ELSE};
     }
+    if(tmp.type == ConditionType::SUB_COMPARE || tmp.type == ConditionType::SUB_IN){
+        if(i.left.is_val)return {tmp, ERR_ELSE};
+        if(!ltb->name_cid.count(i.left.col_name.second))return {tmp, ERR_ELSE};
+        int cid = ltb->name_cid[i.left.col_name.second];
+        BoundColumn ttmp = {ltable_id, cid, lsc.desc[cid].type, lsc.desc[cid].nullable};
+        tmp.left = {i.left.is_val, ttmp, i.left.val};
+        tmp.sub = make_shared<BoundSelectRequest>(BindingSelectRequest(dbm, *i.sub));
+    }
     return {tmp,0};
 }
 BoundDeleteRequest BindingDeleteRequest(DbManager& dbm,UnboundDeleteRequest& req){
@@ -148,12 +160,12 @@ BoundDeleteRequest BindingDeleteRequest(DbManager& dbm,UnboundDeleteRequest& req
     Table* tb = dbm.name_table[req.FROM];
     Schema& sc = tb->mng->tbmeta.schema;
     int table_id = tb->id;
-    for(auto i:req.conditions){
+    for(auto& i:req.conditions){
         if(!i.left.is_val && !i.left.col_name.first.empty() && i.left.col_name.first != req.FROM )return {table_id, conditions, ERR_ELSE};
         if(i.type == ConditionType::COMPARE){
             if(!i.right.is_val && !i.right.col_name.first.empty() && i.right.col_name.first != req.FROM)return {table_id, conditions, ERR_ELSE};
         }
-        pair<Condition,int> tmp = ConditionBindingHelper(tb,tb, i);
+        pair<Condition,int> tmp = ConditionBindingHelper(tb,tb, i, dbm);
         if(tmp.second==0)conditions.push_back(tmp.first);
         else return {table_id, conditions, tmp.second};
     }
@@ -189,12 +201,12 @@ BoundUpdateRequest BindingUpdateRequest(DbManager& dbm,UnboundUpdateRequest& req
         }
         if(holds_alternative<int>(req.values[i]) && col[i].type!=0 || holds_alternative<double>(req.values[i]) && col[i].type!=1 || holds_alternative<string>(req.values[i]) && col[i].type!=2)return BoundUpdateRequest{tb->id, col, req.values, conditions, ERR_ELSE};
     }
-    for(auto i:req.conditions){
+    for(auto& i:req.conditions){
         if(!i.left.is_val && !i.left.col_name.first.empty() && i.left.col_name.first != req.FROM )return BoundUpdateRequest{tb->id, col, req.values, conditions, ERR_ELSE};
         if(i.type == ConditionType::COMPARE){
             if(!i.right.is_val && !i.right.col_name.first.empty() && i.right.col_name.first != req.FROM)return BoundUpdateRequest{tb->id, col, req.values, conditions, ERR_ELSE};
         }
-        pair<Condition,int> tmp = ConditionBindingHelper(tb,tb, i);
+        pair<Condition,int> tmp = ConditionBindingHelper(tb,tb, i, dbm);
         if(tmp.second==0)conditions.push_back(tmp.first);
         else return BoundUpdateRequest{tb->id, col, req.values, conditions, tmp.second};
     }
@@ -206,12 +218,14 @@ BoundSelectRequest BindingSelectRequest(DbManager& dbm,UnboundSelectRequest& req
     vector<pair<BoundColumn,OrderBy>> ORDERBY;
     vector<BoundColumn> GROUPBY;
     vector<Condition> conditions;
+    bool star = 0;
     bool withagg = false;
     for(auto i:req.FROM){
-        if(dbm.name_table.count(i)==0)return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE};
+        if(dbm.name_table.count(i)==0)return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
         table_ids.push_back(dbm.name_table[i]->id);
     }
     if(req.col_items[0].first.first.empty() && req.col_items[0].first.second == "*"){
+        star = 1;
         for(auto i:table_ids){
             Schema& sc = dbm.id_table[i]->mng->tbmeta.schema;
             for(int j=0;j<sc.col;j++){ 
@@ -227,7 +241,7 @@ BoundSelectRequest BindingSelectRequest(DbManager& dbm,UnboundSelectRequest& req
         if(agg!=AggregateFunc::NONE)withagg = true;
         if(table_name.empty()&&col_name.empty()){
             if(agg==AggregateFunc::COUNT)col_items.push_back({std::nullopt, agg});
-            else return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE};
+            else return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
         }
         else if(table_name.empty()&&!col_name.empty()){
             int cnt=0,idx=0,cid=0;
@@ -235,13 +249,13 @@ BoundSelectRequest BindingSelectRequest(DbManager& dbm,UnboundSelectRequest& req
                 Table* tb = dbm.id_table[j];
                 if(tb->name_cid.count(col_name))idx=j,cid=tb->name_cid[col_name],cnt++;
             }
-            if(cnt==0||cnt>1)return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE};
+            if(cnt==0||cnt>1)return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
             Schema& sc = dbm.id_table[idx]->mng->tbmeta.schema;
             BoundColumn tmp={idx,cid,sc.desc[cid].type,sc.desc[cid].nullable};
             col_items.push_back({tmp,agg});
         }
         else if(!table_name.empty()&&!col_name.empty()){
-            if(!dbm.name_table.count(table_name) )return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE};
+            if(!dbm.name_table.count(table_name) )return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
             int flag=0;
             for(int i=0;i<table_ids.size();i++){
                 if(dbm.id_table[table_ids[i]]->name == table_name){
@@ -249,22 +263,22 @@ BoundSelectRequest BindingSelectRequest(DbManager& dbm,UnboundSelectRequest& req
                     break;
                 }
             }
-            if(!flag)return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE};
+            if(!flag)return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
             Table* tb = dbm.name_table[table_name];
-            if(!tb->name_cid.count(col_name))return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE};
+            if(!tb->name_cid.count(col_name))return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
             int cid = tb->name_cid[col_name];
             Schema& sc = tb->mng->tbmeta.schema;
             BoundColumn tmp={tb->id,cid,sc.desc[cid].type,sc.desc[cid].nullable};
             col_items.push_back({tmp,agg});
         }
-        else return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE};
-        if((agg == AggregateFunc::AVG || agg == AggregateFunc::SUM) && col_items.back().first->type != 0 && col_items.back().first->type != 1)return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE};
+        else return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
+        if((agg == AggregateFunc::AVG || agg == AggregateFunc::SUM) && col_items.back().first->type != 0 && col_items.back().first->type != 1)return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
     }
     for(auto i:req.ORDERBY){
         string table_name = i.first.first, col_name = i.first.second;
         OrderBy od = i.second;
         if(table_name.empty()&&col_name.empty()){
-            return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE};
+            return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
         }
         else if(table_name.empty()&&!col_name.empty()){
             int cnt=0,idx=0,cid=0;
@@ -272,13 +286,13 @@ BoundSelectRequest BindingSelectRequest(DbManager& dbm,UnboundSelectRequest& req
                 Table* tb = dbm.id_table[j];
                 if(tb->name_cid.count(col_name))idx=j,cid=tb->name_cid[col_name],cnt++;
             }
-            if(cnt==0||cnt>1)return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE};
+            if(cnt==0||cnt>1)return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
             Schema& sc = dbm.id_table[idx]->mng->tbmeta.schema;
             BoundColumn tmp={idx,cid,sc.desc[cid].type,sc.desc[cid].nullable};
             ORDERBY.push_back({tmp,od});
         }
         else if(!table_name.empty()&&!col_name.empty()){
-            if(!dbm.name_table.count(table_name))return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE};
+            if(!dbm.name_table.count(table_name))return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
             int flag=0;
             for(int i=0;i<table_ids.size();i++){
                 if(dbm.id_table[table_ids[i]]->name == table_name){
@@ -286,20 +300,20 @@ BoundSelectRequest BindingSelectRequest(DbManager& dbm,UnboundSelectRequest& req
                     break;
                 }
             }
-            if(!flag)return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE};
+            if(!flag)return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
             Table* tb = dbm.name_table[table_name];
-            if(!tb->name_cid.count(col_name))return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE};
+            if(!tb->name_cid.count(col_name))return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
             int cid = tb->name_cid[col_name];
             Schema& sc = tb->mng->tbmeta.schema;
             BoundColumn tmp={tb->id,cid,sc.desc[cid].type,sc.desc[cid].nullable};
             ORDERBY.push_back({tmp,od});
         }
-        else return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE};
+        else return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
     }
     for(auto i:req.GROUPBY){
         string table_name = i.first, col_name = i.second;
         if(table_name.empty()&&col_name.empty()){
-            return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE};
+            return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
         }
         else if(table_name.empty()&&!col_name.empty()){
             int cnt=0,idx=0,cid=0;
@@ -307,13 +321,13 @@ BoundSelectRequest BindingSelectRequest(DbManager& dbm,UnboundSelectRequest& req
                 Table* tb = dbm.id_table[j];
                 if(tb->name_cid.count(col_name))idx=j,cid=tb->name_cid[col_name],cnt++;
             }
-            if(cnt==0||cnt>1)return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE};
+            if(cnt==0||cnt>1)return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
             Schema& sc = dbm.id_table[idx]->mng->tbmeta.schema;
             BoundColumn tmp={idx,cid,sc.desc[cid].type,sc.desc[cid].nullable};
             GROUPBY.push_back(tmp);
         }
         else if(!table_name.empty()&&!col_name.empty()){
-            if(!dbm.name_table.count(table_name))return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE};
+            if(!dbm.name_table.count(table_name))return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
             int flag=0;
             for(int i=0;i<table_ids.size();i++){
                 if(dbm.id_table[table_ids[i]]->name == table_name){
@@ -321,17 +335,17 @@ BoundSelectRequest BindingSelectRequest(DbManager& dbm,UnboundSelectRequest& req
                     break;
                 }
             }
-            if(!flag)return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE};
+            if(!flag)return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
             Table* tb = dbm.name_table[table_name];
-            if(!tb->name_cid.count(col_name))return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE};
+            if(!tb->name_cid.count(col_name))return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
             int cid = tb->name_cid[col_name];
             Schema& sc = tb->mng->tbmeta.schema;
             BoundColumn tmp={tb->id,cid,sc.desc[cid].type,sc.desc[cid].nullable};
             GROUPBY.push_back(tmp);
         }
-        else return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE};
+        else return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
     }
-    if(withagg || !req.GROUPBY.empty())
+    /*if(withagg || !req.GROUPBY.empty())
     for(int i=0;i<col_items.size();i++){
         if(col_items[i].first&&col_items[i].second == AggregateFunc::NONE){
             int flag=0;
@@ -341,10 +355,10 @@ BoundSelectRequest BindingSelectRequest(DbManager& dbm,UnboundSelectRequest& req
                     break;
                 }
             }
-            if(!flag)return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE};
+            if(!flag)return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
         }
-    }
-    for(auto i:req.conditions){
+    }*/
+    for(auto& i:req.conditions){
         if(i.type == ConditionType::COMPARE){
             if(!i.left.is_val&&!i.right.is_val){
                 string l_tname = i.left.col_name.first, l_cname = i.left.col_name.second;
@@ -356,11 +370,11 @@ BoundSelectRequest BindingSelectRequest(DbManager& dbm,UnboundSelectRequest& req
                     for(auto j:table_ids){
                         if(dbm.id_table[j]->name_cid.count(l_cname))cnt++, idx = j;
                     }
-                    if(cnt==0||cnt>1)return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE};
+                    if(cnt==0||cnt>1)return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
                     l = dbm.id_table[idx];
                 }
                 else{
-                    if(!dbm.name_table.count(l_tname))return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE};
+                    if(!dbm.name_table.count(l_tname))return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
                     l = dbm.name_table[l_tname];
                     int flag=0;
                     for(auto j:table_ids){
@@ -368,18 +382,18 @@ BoundSelectRequest BindingSelectRequest(DbManager& dbm,UnboundSelectRequest& req
                             flag=1;break;
                         }
                     }
-                    if(!flag)return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE};
+                    if(!flag)return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
                 }
                 if(r_tname.empty()){
                     int cnt=0,idx=0;
                     for(auto j:table_ids){
                         if(dbm.id_table[j]->name_cid.count(r_cname))cnt++, idx = j;
                     }
-                    if(cnt==0||cnt>1)return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE};
+                    if(cnt==0||cnt>1)return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
                     r = dbm.id_table[idx];
                 }
                 else{
-                    if(!dbm.name_table.count(r_tname))return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE};
+                    if(!dbm.name_table.count(r_tname))return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
                     r = dbm.name_table[r_tname];
                     int flag=0;
                     for(auto j:table_ids){
@@ -387,12 +401,12 @@ BoundSelectRequest BindingSelectRequest(DbManager& dbm,UnboundSelectRequest& req
                             flag=1;break;
                         }
                     }
-                    if(!flag)return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE};
+                    if(!flag)return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
                 }
-                if(!l->name_cid.count(l_cname) || !r->name_cid.count(r_cname))return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE};
-                pair<Condition,int> tmp = ConditionBindingHelper(l, r, i);
+                if(!l->name_cid.count(l_cname) || !r->name_cid.count(r_cname))return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
+                pair<Condition,int> tmp = ConditionBindingHelper(l, r, i, dbm);
                 if(tmp.second==0)conditions.push_back(tmp.first);
-                else return BoundSelectRequest{table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, tmp.second};
+                else return BoundSelectRequest{table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, tmp.second, star};
             }
             else if(!i.left.is_val){
                 string l_tname = i.left.col_name.first, l_cname = i.left.col_name.second;
@@ -403,11 +417,11 @@ BoundSelectRequest BindingSelectRequest(DbManager& dbm,UnboundSelectRequest& req
                     for(auto j:table_ids){
                         if(dbm.id_table[j]->name_cid.count(l_cname))cnt++, idx = j;
                     }
-                    if(cnt==0||cnt>1)return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE};
+                    if(cnt==0||cnt>1)return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
                     l = dbm.id_table[idx];
                 }
                 else{
-                    if(!dbm.name_table.count(l_tname))return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE};
+                    if(!dbm.name_table.count(l_tname))return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
                     l = dbm.name_table[l_tname];
                     int flag=0;
                     for(auto j:table_ids){
@@ -415,13 +429,13 @@ BoundSelectRequest BindingSelectRequest(DbManager& dbm,UnboundSelectRequest& req
                             flag=1;break;
                         }
                     }
-                    if(!flag)return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE};
+                    if(!flag)return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
                 }
-                if(!l->name_cid.count(l_cname))return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE};
+                if(!l->name_cid.count(l_cname))return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
                 lcid = l->name_cid.count(l_cname);
-                pair<Condition,int> tmp = ConditionBindingHelper(l, l, i);
+                pair<Condition,int> tmp = ConditionBindingHelper(l, l, i, dbm);
                 if(tmp.second==0)conditions.push_back(tmp.first);
-                else return BoundSelectRequest{table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, tmp.second};
+                else return BoundSelectRequest{table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, tmp.second, star};
             }
             else if(i.left.is_val&&!i.right.is_val){
                 string r_tname = i.right.col_name.first, r_cname = i.right.col_name.second;
@@ -432,11 +446,11 @@ BoundSelectRequest BindingSelectRequest(DbManager& dbm,UnboundSelectRequest& req
                     for(auto j:table_ids){
                         if(dbm.id_table[j]->name_cid.count(r_cname))cnt++, idx = j;
                     }
-                    if(cnt==0||cnt>1)return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE};
+                    if(cnt==0||cnt>1)return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
                     r = dbm.id_table[idx];
                 }
                 else{
-                    if(!dbm.name_table.count(r_tname))return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE};
+                    if(!dbm.name_table.count(r_tname))return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
                     r = dbm.name_table[r_tname];
                     int flag=0;
                     for(auto j:table_ids){
@@ -444,15 +458,15 @@ BoundSelectRequest BindingSelectRequest(DbManager& dbm,UnboundSelectRequest& req
                             flag=1;break;
                         }
                     }
-                    if(!flag)return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE};
+                    if(!flag)return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
                 }
-                if(!r->name_cid.count(r_cname))return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE};
+                if(!r->name_cid.count(r_cname))return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
                 rcid = r->name_cid.count(r_cname);
-                pair<Condition,int> tmp = ConditionBindingHelper(r, r, i);
+                pair<Condition,int> tmp = ConditionBindingHelper(r, r, i, dbm);
                 if(tmp.second==0)conditions.push_back(tmp.first);
-                else return BoundSelectRequest{table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, tmp.second};
+                else return BoundSelectRequest{table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, tmp.second, star};
             }
-            else return BoundSelectRequest{table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE};
+            else return BoundSelectRequest{table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
         }
         else{
             if(!i.left.is_val){
@@ -464,11 +478,11 @@ BoundSelectRequest BindingSelectRequest(DbManager& dbm,UnboundSelectRequest& req
                     for(auto j:table_ids){
                         if(dbm.id_table[j]->name_cid.count(l_cname))cnt++, idx = j;
                     }
-                    if(cnt==0||cnt>1)return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE};
+                    if(cnt==0||cnt>1)return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
                     l = dbm.id_table[idx];
                 }
                 else{
-                    if(!dbm.name_table.count(l_tname))return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE};
+                    if(!dbm.name_table.count(l_tname))return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
                     l = dbm.name_table[l_tname];
                     int flag=0;
                     for(auto j:table_ids){
@@ -476,18 +490,18 @@ BoundSelectRequest BindingSelectRequest(DbManager& dbm,UnboundSelectRequest& req
                             flag=1;break;
                         }
                     }
-                    if(!flag)return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE};
+                    if(!flag)return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
                 }
-                if(!l->name_cid.count(l_cname))return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE};
+                if(!l->name_cid.count(l_cname))return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
                 lcid = l->name_cid.count(l_cname);
-                pair<Condition,int> tmp = ConditionBindingHelper(l, l, i);
+                pair<Condition,int> tmp = ConditionBindingHelper(l, l, i, dbm);
                 if(tmp.second==0)conditions.push_back(tmp.first);
-                else return BoundSelectRequest{table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, tmp.second};
+                else return BoundSelectRequest{table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, tmp.second, star};
             }
-            else return BoundSelectRequest{table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE};
+            else return BoundSelectRequest{table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
         }
     }
-    return BoundSelectRequest{table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, 0};
+    return BoundSelectRequest{table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, 0, star};
 }
 inline bool like(std::string_view text, std::string_view pattern) {
     size_t t_idx = 0, p_idx = 0;
@@ -518,6 +532,396 @@ inline bool like(std::string_view text, std::string_view pattern) {
     }
     return p_idx == pattern.length();
 }
-unique_ptr<Operator> Planner(BoundSelectRequest& bsr){
+unique_ptr<Operator> ScanMother(DbManager* dbm, vector<Condition>& conditions, int table_id);
+unique_ptr<Operator> Planner(DbManager* dbm, BoundSelectRequest& bsr){//记得有聚合的时候不用Project
+    if(bsr.errorcode!=0 || bsr.table_ids.empty())return nullptr;
+    unique_ptr<Operator> root = nullptr;
+    bool has_agg=0;
+    for(auto i:bsr.col_items){
+        if(i.second!=AggregateFunc::NONE){
+            has_agg=1;
+            break;
+        }
+    }
+    for(auto& i:bsr.conditions){
+        if(i.type == ConditionType::SUB_COMPARE){
+            unique_ptr<Operator> root = Planner(dbm, *(i.sub));
+            Tuple input;
+            if(root == nullptr || root->Open())return nullptr;
+            int res = root->Next(input);
+            if(res == -1 || res == 1){
+                root->Close();
+                return nullptr;
+            }
+            i.type = ConditionType::COMPARE;
+            i.right.is_val = true;
+            i.right.val = input.values[0];
+            root->Close();
+        }
+        else if(i.type == ConditionType::SUB_IN){
+            unique_ptr<Operator> root = Planner(dbm, *(i.sub));
+            Tuple input;
+            if(root == nullptr || root->Open())return nullptr;
+            while(1){
+                int res = root->Next(input);
+                if(res == -1){
+                    root->Close();
+                    return nullptr;
+                }
+                if(res == 1){
+                    root->Close();
+                    break;
+                }
+                i.values.push_back(input.values[0]);
+            }
+            i.type = ConditionType::IN_LIST;
+            root->Close();
+        }
+    }
+    if(bsr.table_ids.size() == 1){
+        root = ScanMother(dbm, bsr.conditions, bsr.table_ids[0]);
+        if(bsr.conditions.size()>0)root = make_unique<Filter>(dbm, move(root), bsr.conditions);
+        bool flag=0;
+        for(auto i:bsr.ORDERBY){
+            bool flag2=0;
+            for(auto j:bsr.col_items){
+                if(j.first && i.first == j.first.value()){
+                    flag2 = 1;
+                    break;
+                }
+            }
+            if(!flag2){
+                flag=1;
+                break;
+            }
+        }
+        if(!flag){
+            if(!bsr.GROUPBY.empty() || has_agg)root = make_unique<Aggregate>(dbm, move(root), bsr);
+            if(!bsr.star && bsr.GROUPBY.empty() && !has_agg)root = make_unique<Project>(dbm, move(root), bsr);
+            if(!bsr.ORDERBY.empty())root = make_unique<Sort>(dbm, move(root), bsr, bsr.LIMIT, bsr.OFFSET);
+            if(bsr.LIMIT!=-1)root = make_unique<Limit>(dbm, move(root), bsr);
+        }
+        else{
+            if(!bsr.GROUPBY.empty() || has_agg)root = make_unique<Aggregate>(dbm, move(root), bsr);
+            if(!bsr.ORDERBY.empty())root = make_unique<Sort>(dbm, move(root), bsr, bsr.LIMIT, bsr.OFFSET);
+            if(!bsr.star && bsr.GROUPBY.empty() && !has_agg)root = make_unique<Project>(dbm, move(root), bsr);
+            if(bsr.LIMIT!=-1)root = make_unique<Limit>(dbm, move(root), bsr);
+        }
+    }
+    else{
+        unordered_set<int> tids;
+        root = ScanMother(dbm, bsr.conditions, bsr.table_ids[bsr.table_ids.size()-1]);
+        int i = bsr.table_ids[bsr.table_ids.size()-1];
+        vector<Condition> tmp;
+        for(auto& j:bsr.conditions){
+            if(j.type == ConditionType::COMPARE){
+                if((j.left.is_val || j.left.col.table_id == i) && (j.right.is_val || j.right.col.table_id == i)){
+                    tmp.push_back(j);
+                }
+            }
+            else{
+                if(j.left.col.table_id == i)tmp.push_back(j);
+            }
+        }
+        if(tmp.size()>0)root = make_unique<Filter>(dbm, move(root), tmp);
+        tids.insert(i);
+        for(int ii=bsr.table_ids.size()-2;ii>=0;ii--){
+            int i = bsr.table_ids[ii];
+            unique_ptr<Operator>tmptr = ScanMother(dbm, bsr.conditions, i);
+            vector<Condition> tmp,tmp2;
+            for(auto& j:bsr.conditions){
+                if(j.type == ConditionType::COMPARE){
+                    if((j.left.is_val || j.left.col.table_id == i) && (j.right.is_val || j.right.col.table_id == i)){
+                        tmp.push_back(j);
+                    }
+                    else if((!j.left.is_val && !j.right.is_val) && (j.left.col.table_id == i && tids.count(j.right.col.table_id) || j.right.col.table_id == i && tids.count(j.left.col.table_id))){
+                        tmp2.push_back(j);
+                    }
+                }
+                else{
+                    if(j.left.col.table_id == i)tmp.push_back(j);
+                }
+            }
+            if(tmp.size()>0)tmptr = make_unique<Filter>(dbm, move(tmptr), tmp);
+            tmp.clear();
+            root = make_unique<BNLJ>(dbm, move(tmptr), move(root), tmp2);
+            tids.insert(i);
+        }
+        bool flag=0;
+        for(auto i:bsr.ORDERBY){
+            bool flag2=0;
+            for(auto j:bsr.col_items){
+                if(j.first && i.first == j.first.value()){
+                    flag2 = 1;
+                    break;
+                }
+            }
+            if(!flag2){
+                flag=1;
+                break;
+            }
+        }
+        if(!flag){
+            if(!bsr.GROUPBY.empty() || has_agg)root = make_unique<Aggregate>(dbm, move(root), bsr);
+            if(!bsr.star && bsr.GROUPBY.empty() && !has_agg)root = make_unique<Project>(dbm, move(root), bsr);
+            if(!bsr.ORDERBY.empty())root = make_unique<Sort>(dbm, move(root), bsr, bsr.LIMIT, bsr.OFFSET);
+            if(bsr.LIMIT!=-1)root = make_unique<Limit>(dbm, move(root), bsr);
+        }
+        else{
+            if(!bsr.GROUPBY.empty() || has_agg)root = make_unique<Aggregate>(dbm, move(root), bsr);
+            if(!bsr.ORDERBY.empty())root = make_unique<Sort>(dbm, move(root), bsr, bsr.LIMIT, bsr.OFFSET);
+            if(!bsr.star && bsr.GROUPBY.empty() && !has_agg)root = make_unique<Project>(dbm, move(root), bsr);
+            if(bsr.LIMIT!=-1)root = make_unique<Limit>(dbm, move(root), bsr);
+        }
+    }
+    return root;
+}
+struct LeftBound{
+    Value val;
+    bool inclusive;
+    std::partial_ordering operator<=>(const LeftBound& other) const {
+        if (auto cmp = val <=> other.val; cmp != 0) {
+            return cmp;
+        }
+        return other.inclusive <=> inclusive;
+    }
 
+    bool operator==(const LeftBound& other) const {
+        return val == other.val && inclusive== other.inclusive;
+    }
+};
+struct RightBound{
+    Value val;
+    bool inclusive;
+    auto operator<=>(const RightBound&) const = default;
+};
+struct ScanCandidate{
+    Row l;
+    Row r;
+    bool linc;
+    bool rinc;
+    int idx;
+    Index* index;
+    int score;
+};
+unique_ptr<Operator> ScanMother(DbManager* dbm, vector<Condition>& conditions, int table_id){
+    Table* tb = dbm->id_table[table_id];
+    vector<Index*> index = dbm->id_normidx[table_id];
+    if(tb->pkid!=-1)index.push_back(dbm->id_idx[tb->pkid]);
+    unordered_map<int, LeftBound> cid_leftbound;
+    unordered_map<int, RightBound> cid_rightbound;
+    Schema& sc = tb->mng->tbmeta.schema;
+    optional<ScanCandidate> candidate = nullopt;
+    for(auto j:conditions){
+        int flag = 0;
+        if(j.type == ConditionType::COMPARE){
+            if(j.left.is_val&&!j.right.is_val&&j.right.col.table_id == table_id){
+                swap(j.left,j.right);
+                if(j.op == CompareOp::GE)j.op = CompareOp::LE;
+                else if(j.op == CompareOp::GT)j.op = CompareOp::LT;
+                else if(j.op == CompareOp::LE)j.op = CompareOp::GE;
+                else if(j.op == CompareOp::LT)j.op = CompareOp::GT;
+                flag = 1;
+            }
+            if(!j.left.is_val&&j.right.is_val&&j.left.col.table_id == table_id){
+                if(j.op==CompareOp::EQ){
+                    int cid = j.left.col.cid;
+                    bool inc = true;
+                    Value& val = j.right.val;
+                    cid_leftbound[cid] = (cid_leftbound.count(cid)?max(cid_leftbound[cid], LeftBound{val,inc}):LeftBound{val,inc});
+                    cid_rightbound[cid] = (cid_rightbound.count(cid)?min(cid_rightbound[cid], RightBound{val,inc}):RightBound{val,inc});
+                }else if(j.op == CompareOp::GE){
+                    int cid = j.left.col.cid;
+                    bool inc = true;
+                    Value& val = j.right.val;
+                    cid_leftbound[cid] = (cid_leftbound.count(cid)?max(cid_leftbound[cid], LeftBound{val,inc}):LeftBound{val,inc});
+                }else if(j.op == CompareOp::GT){
+                    int cid = j.left.col.cid;
+                    bool inc = false;
+                    Value& val = j.right.val;
+                    cid_leftbound[cid] = (cid_leftbound.count(cid)?max(cid_leftbound[cid], LeftBound{val,inc}):LeftBound{val,inc});
+                }else if(j.op == CompareOp::LE){
+                    int cid = j.left.col.cid;
+                    bool inc = true;
+                    Value& val = j.right.val;
+                    cid_rightbound[cid] = (cid_rightbound.count(cid)?min(cid_rightbound[cid], RightBound{val,inc}):RightBound{val,inc});
+                }else if(j.op == CompareOp::LT){
+                    int cid = j.left.col.cid;
+                    bool inc = false;
+                    Value& val = j.right.val;
+                    cid_rightbound[cid] = (cid_rightbound.count(cid)?min(cid_rightbound[cid], RightBound{val,inc}):RightBound{val,inc});
+                }
+            }
+        }
+        if(flag){
+            swap(j.left,j.right);
+            if(j.op == CompareOp::GE)j.op = CompareOp::LE;
+            else if(j.op == CompareOp::GT)j.op = CompareOp::LT;
+            else if(j.op == CompareOp::LE)j.op = CompareOp::GE;
+            else if(j.op == CompareOp::LT)j.op = CompareOp::GT;
+        }
+    }
+    for(auto i : index){
+        int idx=-1, flag=0;
+        for(int j=0;j<i->col;j++){
+            if(cid_leftbound.count(i->cid[j])&&cid_rightbound.count(i->cid[j])){
+                LeftBound& l = cid_leftbound[i->cid[j]];
+                RightBound& r = cid_rightbound[i->cid[j]];
+                if(l.inclusive == r.inclusive && l.inclusive == 1 && l.val == r.val){
+                    idx++;
+                    continue;
+                }
+            }
+            if(cid_leftbound.count(i->cid[j]) || cid_rightbound.count(i->cid[j])){
+                idx++;
+                flag=1;
+            }
+            break;
+        }
+        if(idx == -1)continue;
+        else{
+            Row l,r;
+            for(int j=0;j<idx;j++){
+                l.push_back(cid_leftbound[i->cid[j]].val),r.push_back(cid_rightbound[i->cid[j]].val);
+            }
+            bool linc=1,rinc=1;
+            if(!cid_leftbound.count(i->cid[idx])){
+                if(sc.desc[i->cid[idx]].nullable)l.push_back(false);
+                else if(sc.desc[i->cid[idx]].type == 0)l.push_back(INT_MIN);
+                else if(sc.desc[i->cid[idx]].type == 1)l.push_back(-DBL_MAX);
+                else if(sc.desc[i->cid[idx]].type == 2)l.push_back("");
+                else if(sc.desc[i->cid[idx]].type == 3)l.push_back(DATE{INT_MIN});
+            }
+            else l.push_back(cid_leftbound[i->cid[idx]].val),linc=cid_leftbound[i->cid[idx]].inclusive;
+            if(!cid_rightbound.count(i->cid[idx])){
+                if(sc.desc[i->cid[idx]].type == 0)r.push_back(INT_MAX);
+                else if(sc.desc[i->cid[idx]].type == 1)r.push_back(DBL_MAX);
+                else if(sc.desc[i->cid[idx]].type == 2){
+                    std::string max_str(sc.desc[i->cid[idx]].len, static_cast<unsigned char>(0xFF));
+                    r.push_back(max_str);
+                }
+                else if(sc.desc[i->cid[idx]].type == 3)r.push_back(DATE{INT_MAX});
+            }
+            else r.push_back(cid_rightbound[i->cid[idx]].val),rinc=cid_rightbound[i->cid[idx]].inclusive;
+            for(int j=idx+1;j<i->col;j++){
+                if(linc){
+                    if(sc.desc[i->cid[j]].nullable)l.push_back(false);
+                    else if(sc.desc[i->cid[j]].type == 0)l.push_back(INT_MIN);
+                    else if(sc.desc[i->cid[j]].type == 1)l.push_back(-DBL_MAX);
+                    else if(sc.desc[i->cid[j]].type == 2)l.push_back("");
+                    else if(sc.desc[i->cid[j]].type == 3)l.push_back(DATE{INT_MIN});
+                }
+                else{
+                    if(sc.desc[i->cid[j]].type == 0)l.push_back(INT_MAX);
+                    else if(sc.desc[i->cid[j]].type == 1)l.push_back(DBL_MAX);
+                    else if(sc.desc[i->cid[j]].type == 2){
+                        std::string max_str(sc.desc[i->cid[j]].len, static_cast<char>(0xFF));
+                        l.push_back(max_str);
+                    }
+                    else if(sc.desc[i->cid[j]].type == 3){
+                        l.push_back(DATE{INT_MAX});
+                    }
+                }
+                if(rinc){
+                    if(sc.desc[i->cid[j]].type == 0)r.push_back(INT_MAX);
+                    else if(sc.desc[i->cid[j]].type == 1)r.push_back(DBL_MAX);
+                    else if(sc.desc[i->cid[j]].type == 2){
+                        std::string max_str(sc.desc[i->cid[j]].len, static_cast<char>(0xFF));
+                        r.push_back(max_str);
+                    }
+                    else if(sc.desc[i->cid[j]].type == 3){
+                        r.push_back(DATE{INT_MAX});
+                    }
+                }
+                else{
+                    if(sc.desc[i->cid[j]].nullable)r.push_back(false);
+                    else if(sc.desc[i->cid[j]].type == 0)r.push_back(INT_MIN);
+                    else if(sc.desc[i->cid[j]].type == 1)r.push_back(-DBL_MAX);
+                    else if(sc.desc[i->cid[j]].type == 2)r.push_back("");
+                    else if(sc.desc[i->cid[j]].type == 3)r.push_back(DATE{INT_MIN});
+                }
+            }
+            int score = 0;
+            if(i->uni == 1)score++;
+            if(!flag) score+=idx*2;
+            else score+=idx*2-1;
+            if(cid_leftbound.count(i->cid[idx]) && cid_rightbound.count(i->cid[idx]))score+=2;
+            else score++;
+            if(candidate==nullopt||candidate.value().score < score)candidate = ScanCandidate{l, r, linc, rinc, idx, i, score};
+        }
+    }
+    if(candidate == nullopt)return make_unique<SeqScan>(dbm, table_id);
+    return make_unique<IndexScan>(dbm, candidate.value().index, candidate.value().l, candidate.value().r, candidate.value().linc, candidate.value().rinc);
+}
+int tuple_deserialization(vector<char>& src, Row& dest, vector<SlotType>& slots, int row_size, int offset){
+    int nullen = slots[0].offset, col = slots.size(), j = slots[0].offset;
+    char* row = src.data() + offset;
+    dest.clear();
+    for(int i=0;i<col;i++){
+        SlotType& desc = slots[i];
+        if(row[(i>>3)] & (1u<<(i&7))){
+            bool tmp=false;
+            dest.push_back(tmp);
+        }
+        else{
+            if(desc.type == 0){
+                int tmp;
+                memcpy(&tmp, row+j, desc.len);
+                dest.push_back(tmp);
+            }else if(desc.type == 1){
+                double tmp;
+                memcpy(&tmp, row+j, desc.len);
+                dest.push_back(tmp);
+            }else if(desc.type == 2){
+                size_t len = strnlen(row + j, desc.len);
+                string tmp(row + j, len);
+                dest.push_back(tmp);
+            }else if(desc.type == 3){
+                DATE tmp;
+                memcpy(&tmp, row+j, desc.len);
+                dest.push_back(tmp);
+            }
+            else if(desc.type == 4){
+                long long tmp;
+                memcpy(&tmp, row+j, desc.len);
+                dest.push_back(tmp);
+            }
+        }
+        j += desc.len;
+    }
+    return 0;
+}
+int tuple_serialization(Row& src, vector<char>& dest, vector<SlotType>& slots, int row_size, int offset){
+    memset(dest.data()+offset,0,row_size);
+    int nullen = slots[0].offset, col = slots.size(), j = slots[0].offset;
+    char* row = dest.data()+offset;
+    for(int i=0;i<col;i++){
+        SlotType& desc = slots[i];
+        if(holds_alternative<bool>(src[i])){
+            row[(i >> 3)] |= 1u << (i&7);
+        }
+        else{
+            row[(i >> 3)] &= ~(1u << (i&7));
+            if(desc.type == 0 && holds_alternative<int>(src[i])){
+                memcpy(row+j,&(get<int>(src[i])),desc.len);
+            }else if(desc.type == 1 && holds_alternative<double>(src[i])){
+                memcpy(row+j,&(get<double>(src[i])),desc.len);
+            }else if(desc.type == 2 && holds_alternative<string>(src[i])){
+                string tmp = get<string>(src[i]);
+                if (tmp.size() > static_cast<size_t>(desc.len))
+                    return -1;
+                size_t tmplen = tmp.size();
+                tmp.copy(row+j,tmplen,0);
+                memset(row+j+tmplen,0,desc.len-tmplen);
+            }else if(desc.type == 3 && holds_alternative<DATE>(src[i])){
+                memcpy(row+j,&(get<DATE>(src[i])),desc.len);
+            }
+            else if(desc.type == 4 && holds_alternative<long long>(src[i])){
+                memcpy(row+j,&(get<long long>(src[i])),desc.len);
+            }
+            else return -1;
+        }
+        j += desc.len;
+    }
+    return 0;
 }

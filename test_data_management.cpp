@@ -31,7 +31,7 @@ Schema makeSchema() {
     schema.offset[0] = schema.nullen;
     std::strcpy(schema.desc[0].name, "payload");
     schema.desc[0].type = 2;
-    schema.desc[0].vcharlen = kRecordSize - schema.nullen;
+    schema.desc[0].len = kRecordSize - schema.nullen;
     schema.desc[0].nullable = 1;
     schema.desc[0].defalutable = 0;
     return schema;
@@ -51,7 +51,6 @@ Schema makeMultiColumnSchema() {
     schema.desc[0].nullable = 0;
     schema.desc[0].defalutable = 1;
     schema.desc[0].default_offset = 0;
-    schema.desc[0].default_len = sizeof(int);
     const int defaultId = 42;
     std::memcpy(schema.defval + schema.desc[0].default_offset, &defaultId,
                 sizeof(defaultId));
@@ -61,15 +60,13 @@ Schema makeMultiColumnSchema() {
     schema.desc[1].nullable = 1;
     schema.desc[1].defalutable = 1;
     schema.desc[1].default_offset = -1;
-    schema.desc[1].default_len = 0;
 
     std::strcpy(schema.desc[2].name, "name");
     schema.desc[2].type = 2;
-    schema.desc[2].vcharlen = 17;
+    schema.desc[2].len = 17;
     schema.desc[2].nullable = 0;
     schema.desc[2].defalutable = 1;
     schema.desc[2].default_offset = sizeof(int);
-    schema.desc[2].default_len = 7;
     std::memcpy(schema.defval + schema.desc[2].default_offset, "unknown", 7);
     return schema;
 }
@@ -87,15 +84,51 @@ std::string testPath(const char* testName) {
     return "/tmp/ljcdb_" + std::to_string(getpid()) + "_" + testName + ".db";
 }
 
-RecordManager* createTable(const std::string& path) {
+struct RecordStorage {
+    FileManager fm_storage;
+    BufPageManager bpm_storage;
+    int fid_storage = -1;
+    bool closed = false;
+
+    RecordStorage(const std::string& path, bool create)
+        : bpm_storage(&fm_storage) {
+        if (create) {
+            std::remove(path.c_str());
+            require(fm_storage.createFile(path.c_str()), "createFile failed");
+        }
+        require(fm_storage.openFile(path.c_str(), fid_storage),
+                "openFile failed");
+    }
+
+    void flushAndClose() {
+        if (closed) return;
+        bpm_storage.close();
+        fm_storage.closeFile(fid_storage);
+        closed = true;
+    }
+
+    ~RecordStorage() { flushAndClose(); }
+};
+
+struct TestRecordManager : private RecordStorage, public RecordManager {
+    TestRecordManager(const std::string& path, Schema& schema)
+        : RecordStorage(path, true),
+          RecordManager(fid_storage, &bpm_storage, schema) {}
+
+    explicit TestRecordManager(const std::string& path)
+        : RecordStorage(path, false),
+          RecordManager(fid_storage, &bpm_storage) {}
+
+    void flushAndClose() { RecordStorage::flushAndClose(); }
+};
+
+TestRecordManager* createTable(const std::string& path) {
     Schema schema = makeSchema();
-    std::remove(path.c_str());
-    return new RecordManager(const_cast<char*>(path.c_str()), schema);
+    return new TestRecordManager(path, schema);
 }
 
-void flushTable(RecordManager* table) {
-    table->bpm->close();
-    table->fm->closeFile(table->fid);
+void flushTable(TestRecordManager* table) {
+    table->flushAndClose();
 }
 
 void expectRecord(RecordManager* table, ull rid, const Record& expected) {
@@ -142,7 +175,7 @@ void expectSchema(const Schema& actual, const Schema& expected) {
 
 void testSchemaMetadata() {
     const std::string path = testPath("schema");
-    RecordManager* table = createTable(path);
+    TestRecordManager* table = createTable(path);
 
     require(table->tbmeta.schema.recordsize == kRecordSize,
             "record size was not derived from schema");
@@ -165,7 +198,7 @@ void testRidEncoding() {
 
 void testInsertAndLoad() {
     const std::string path = testPath("insert_load");
-    RecordManager* table = createTable(path);
+    TestRecordManager* table = createTable(path);
     const Record first = makeRecord(1);
     const Record second = makeRecord(2);
 
@@ -183,7 +216,7 @@ void testInsertAndLoad() {
 
 void testUpdate() {
     const std::string path = testPath("update");
-    RecordManager* table = createTable(path);
+    TestRecordManager* table = createTable(path);
     const Record original = makeRecord(3);
     const Record replacement = makeRecord(4);
 
@@ -196,7 +229,7 @@ void testUpdate() {
 
 void testEraseAndReuseSlot() {
     const std::string path = testPath("erase_reuse");
-    RecordManager* table = createTable(path);
+    TestRecordManager* table = createTable(path);
     const Record first = makeRecord(5);
     const Record second = makeRecord(6);
     const Record replacement = makeRecord(7);
@@ -214,9 +247,33 @@ void testEraseAndReuseSlot() {
     std::remove(path.c_str());
 }
 
+void testRidValidationAndRepeatedErase() {
+    const std::string path = testPath("rid_validation");
+    TestRecordManager* table = createTable(path);
+    Record record = makeRecord(70);
+    const ull rid = table->InsertRecord(record.data());
+
+    require(table->isValid(rid), "inserted RID was not valid");
+    require(!table->isValid(0), "end-sentinel RID was considered valid");
+    require(!table->isValid(RID(2, 0)),
+            "RID on an unallocated page was considered valid");
+    require(!table->isValid(RID(1, table->slotcapa)),
+            "RID beyond the slot capacity was considered valid");
+
+    table->EraseRecord(rid);
+    require(!table->isValid(rid), "erased RID remained valid");
+    table->EraseRecord(rid);
+    require(table->tbmeta.head == 1,
+            "repeated erase corrupted the free-page list");
+    const ull reused = table->InsertRecord(record.data());
+    require(reused == rid && table->isValid(reused),
+            "slot was not reusable after repeated erase");
+    std::remove(path.c_str());
+}
+
 void testBitmapByteBoundary() {
     const std::string path = testPath("bitmap_boundary");
-    RecordManager* table = createTable(path);
+    TestRecordManager* table = createTable(path);
 
     for (int i = 0; i < 9; ++i) {
         Record record = makeRecord(100 + i);
@@ -236,7 +293,7 @@ void testBitmapByteBoundary() {
 
 void testPageRollover() {
     const std::string path = testPath("page_rollover");
-    RecordManager* table = createTable(path);
+    TestRecordManager* table = createTable(path);
     require(table->slotcapa > 8,
             "test requires enough slots to cross a bitmap byte boundary");
 
@@ -255,7 +312,7 @@ void testPageRollover() {
 
 void testFullPageReturnsToFreeList() {
     const std::string path = testPath("full_page_reuse");
-    RecordManager* table = createTable(path);
+    TestRecordManager* table = createTable(path);
 
     for (int i = 0; i < table->slotcapa; ++i) {
         Record record = makeRecord(2000 + i);
@@ -279,12 +336,12 @@ void testFullPageReturnsToFreeList() {
 
 void testPersistence() {
     const std::string path = testPath("persistence");
-    RecordManager* table = createTable(path);
+    TestRecordManager* table = createTable(path);
     const Record record = makeRecord(8);
     table->InsertRecord(const_cast<char*>(record.data()));
     flushTable(table);
 
-    RecordManager* reopened = new RecordManager(const_cast<char*>(path.c_str()));
+    TestRecordManager* reopened = new TestRecordManager(path);
     require(reopened->tbmeta.schema.recordsize == kRecordSize,
             "record size was not restored after reopening");
     require(reopened->tbmeta.schema.col == 1,
@@ -298,23 +355,22 @@ void testSchemaPersistence() {
     const std::string path = testPath("schema_persistence");
     std::remove(path.c_str());
     Schema expected = makeMultiColumnSchema();
-    RecordManager* table =
-        new RecordManager(const_cast<char*>(path.c_str()), expected);
+    TestRecordManager* table = new TestRecordManager(path, expected);
     flushTable(table);
 
-    RecordManager* reopened = new RecordManager(const_cast<char*>(path.c_str()));
+    TestRecordManager* reopened = new TestRecordManager(path);
     expectSchema(reopened->tbmeta.schema, expected);
     std::remove(path.c_str());
 }
 
 void testPageMetadataPersistence() {
     const std::string path = testPath("page_metadata_persistence");
-    RecordManager* table = createTable(path);
+    TestRecordManager* table = createTable(path);
     Record record = makeRecord(10);
     table->InsertRecord(record.data());
     flushTable(table);
 
-    RecordManager* reopened = new RecordManager(const_cast<char*>(path.c_str()));
+    TestRecordManager* reopened = new TestRecordManager(path);
     require(reopened->tbmeta.page == 1,
             "data page count was not restored after reopening");
     require(reopened->tbmeta.head == 1,
@@ -326,13 +382,12 @@ void testSchemaSurvivesPageCreation() {
     const std::string path = testPath("schema_after_page");
     std::remove(path.c_str());
     Schema expected = makeMultiColumnSchema();
-    RecordManager* table =
-        new RecordManager(const_cast<char*>(path.c_str()), expected);
+    TestRecordManager* table = new TestRecordManager(path, expected);
     std::array<char, 30> record{};
     table->InsertRecord(record.data());
     flushTable(table);
 
-    RecordManager* reopened = new RecordManager(const_cast<char*>(path.c_str()));
+    TestRecordManager* reopened = new TestRecordManager(path);
     expectSchema(reopened->tbmeta.schema, expected);
     std::remove(path.c_str());
 }
@@ -341,20 +396,18 @@ void testMaximumVarcharDefaultPersistence() {
     const std::string path = testPath("maximum_varchar_default");
     std::remove(path.c_str());
     Schema expected = makeSchema();
-    expected.desc[0].vcharlen = 2048;
-    expected.recordsize = expected.nullen + expected.desc[0].vcharlen;
+    expected.desc[0].len = 2048;
+    expected.recordsize = expected.nullen + expected.desc[0].len;
     expected.desc[0].defalutable = 1;
     expected.desc[0].default_offset = 0;
-    expected.desc[0].default_len = sizeof(expected.defval);
     for (int i = 0; i < static_cast<int>(sizeof(expected.defval)); ++i) {
         expected.defval[i] = static_cast<char>('a' + i % 26);
     }
 
-    RecordManager* table =
-        new RecordManager(const_cast<char*>(path.c_str()), expected);
+    TestRecordManager* table = new TestRecordManager(path, expected);
     flushTable(table);
 
-    RecordManager* reopened = new RecordManager(const_cast<char*>(path.c_str()));
+    TestRecordManager* reopened = new TestRecordManager(path);
     expectSchema(reopened->tbmeta.schema, expected);
     std::remove(path.c_str());
 }
@@ -364,14 +417,13 @@ void testDefaultValueMetadata() {
     int defaultId = 0;
     std::memcpy(&defaultId,
                 schema.defval + schema.desc[0].default_offset,
-                schema.desc[0].default_len);
+                sizeof(int));
     require(defaultId == 42, "integer default value was stored incorrectly");
     require(schema.desc[1].defalutable == 1 &&
-                schema.desc[1].default_offset == -1 &&
-                schema.desc[1].default_len == 0,
+                schema.desc[1].default_offset == -1,
             "DEFAULT NULL metadata cannot be distinguished");
-    require(std::string(schema.defval + schema.desc[2].default_offset,
-                        schema.desc[2].default_len) == "unknown",
+    require(std::string(schema.defval + schema.desc[2].default_offset, 7) ==
+                "unknown",
             "VARCHAR default value was stored incorrectly");
 }
 
@@ -382,21 +434,17 @@ void testDefaultStatesPersistence() {
 
     expected.desc[0].defalutable = 0;
     expected.desc[0].default_offset = 0;
-    expected.desc[0].default_len = 0;
 
     expected.desc[1].defalutable = 1;
     expected.desc[1].default_offset = -1;
-    expected.desc[1].default_len = 0;
 
     expected.desc[2].defalutable = 1;
     expected.desc[2].default_offset = 0;
-    expected.desc[2].default_len = 0;
 
-    RecordManager* table =
-        new RecordManager(const_cast<char*>(path.c_str()), expected);
+    TestRecordManager* table = new TestRecordManager(path, expected);
     flushTable(table);
 
-    RecordManager* reopened = new RecordManager(const_cast<char*>(path.c_str()));
+    TestRecordManager* reopened = new TestRecordManager(path);
     expectSchema(reopened->tbmeta.schema, expected);
     require(reopened->tbmeta.schema.desc[0].defalutable == 0,
             "missing default was not preserved");
@@ -404,8 +452,7 @@ void testDefaultStatesPersistence() {
                 reopened->tbmeta.schema.desc[1].default_offset == -1,
             "DEFAULT NULL was not preserved");
     require(reopened->tbmeta.schema.desc[2].defalutable == 1 &&
-                reopened->tbmeta.schema.desc[2].default_offset >= 0 &&
-                reopened->tbmeta.schema.desc[2].default_len == 0,
+                reopened->tbmeta.schema.desc[2].default_offset >= 0,
             "empty VARCHAR default was not preserved");
     std::remove(path.c_str());
 }
@@ -417,7 +464,7 @@ void testMetadataFitsOnePage() {
 
 void testRecordTraversal() {
     const std::string path = testPath("record_traversal");
-    RecordManager* table = createTable(path);
+    TestRecordManager* table = createTable(path);
     require(table->FirstRecord() == RID(0, 0),
             "an empty table should have no first record");
 
@@ -449,7 +496,7 @@ void testRecordTraversal() {
 
 void testFirstRecordAfterGap() {
     const std::string path = testPath("first_record_after_gap");
-    RecordManager* table = createTable(path);
+    TestRecordManager* table = createTable(path);
     const ull first = table->InsertRecord(makeRecord(7100).data());
     const ull second = table->InsertRecord(makeRecord(7101).data());
     const ull third = table->InsertRecord(makeRecord(7102).data());
@@ -462,7 +509,7 @@ void testFirstRecordAfterGap() {
 
 void testTraversalAcrossPages() {
     const std::string path = testPath("traversal_across_pages");
-    RecordManager* table = createTable(path);
+    TestRecordManager* table = createTable(path);
     const int capacity = table->slotcapa;
     for (int i = 0; i <= capacity; ++i) {
         Record record = makeRecord(8000 + i);
@@ -490,11 +537,10 @@ void testMaximumColumnNamePersistence() {
     for (int i = 0; i < 32; ++i) {
         expected.desc[0].name[i] = static_cast<char>('a' + i % 26);
     }
-    RecordManager* table =
-        new RecordManager(const_cast<char*>(path.c_str()), expected);
+    TestRecordManager* table = new TestRecordManager(path, expected);
     flushTable(table);
 
-    RecordManager* reopened = new RecordManager(const_cast<char*>(path.c_str()));
+    TestRecordManager* reopened = new TestRecordManager(path);
     require(std::memcmp(reopened->tbmeta.schema.desc[0].name,
                         expected.desc[0].name, 32) == 0,
             "a 32-byte fixed-width column name was not restored");
@@ -503,7 +549,7 @@ void testMaximumColumnNamePersistence() {
 
 void testTwoPagePersistence() {
     const std::string path = testPath("two_page_persistence");
-    RecordManager* table = createTable(path);
+    TestRecordManager* table = createTable(path);
     const int capacity = table->slotcapa;
     for (int i = 0; i <= capacity; ++i) {
         Record record = makeRecord(4000 + i);
@@ -511,7 +557,7 @@ void testTwoPagePersistence() {
     }
     flushTable(table);
 
-    RecordManager* reopened = new RecordManager(const_cast<char*>(path.c_str()));
+    TestRecordManager* reopened = new TestRecordManager(path);
     require(reopened->tbmeta.page == 2,
             "two allocated data pages were not restored");
     require(reopened->tbmeta.head == 2,
@@ -524,7 +570,7 @@ void testTwoPagePersistence() {
 
 void testFreeListPersistence() {
     const std::string path = testPath("free_list_persistence");
-    RecordManager* table = createTable(path);
+    TestRecordManager* table = createTable(path);
     const int capacity = table->slotcapa;
     for (int i = 0; i <= capacity; ++i) {
         Record record = makeRecord(5000 + i);
@@ -536,7 +582,7 @@ void testFreeListPersistence() {
             "page 1 should head the free list after deleting from a full page");
     flushTable(table);
 
-    RecordManager* reopened = new RecordManager(const_cast<char*>(path.c_str()));
+    TestRecordManager* reopened = new TestRecordManager(path);
     require(reopened->tbmeta.head == 1,
             "free-list head was not restored after reopening");
     const Record replacement = makeRecord(6000);
@@ -548,9 +594,9 @@ void testFreeListPersistence() {
     std::remove(path.c_str());
 }
 
-void testDestructorFlushesSafely() {
+void testOwningFixtureFlushesSafely() {
     const std::string path = testPath("destructor");
-    RecordManager* table = createTable(path);
+    TestRecordManager* table = createTable(path);
     Record record = makeRecord(9);
     table->InsertRecord(record.data());
     delete table;
@@ -559,7 +605,7 @@ void testDestructorFlushesSafely() {
     require(stat(path.c_str(), &fileInfo) == 0,
             "table file was not available after destruction");
     require(fileInfo.st_size >= 2 * PAGE_SIZE,
-            "destructor did not flush metadata and data pages before closing the file");
+            "owning fixture did not flush metadata and data pages before closing the file");
     std::remove(path.c_str());
 }
 
@@ -618,6 +664,8 @@ int main() {
         {"insert and load", testInsertAndLoad},
         {"update", testUpdate},
         {"erase and reuse slot", testEraseAndReuseSlot},
+        {"RID validation and repeated erase",
+         testRidValidationAndRepeatedErase},
         {"bitmap byte boundary", testBitmapByteBoundary},
         {"page rollover", testPageRollover},
         {"full page returns to free list", testFullPageReturnsToFreeList},
@@ -636,7 +684,7 @@ int main() {
         {"maximum column name persistence", testMaximumColumnNamePersistence},
         {"two-page persistence", testTwoPagePersistence},
         {"free-list persistence", testFreeListPersistence},
-        {"destructor flush", testDestructorFlushesSafely},
+        {"owning fixture flush", testOwningFixtureFlushesSafely},
     };
 
     int failures = 0;

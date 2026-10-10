@@ -66,6 +66,39 @@ BPTMeta makeMeta(bool unique) {
     return meta;
 }
 
+struct IndexStorage {
+    FileManager fm_storage;
+    BufPageManager bpm_storage;
+    int fid_storage = -1;
+    bool closed = false;
+
+    IndexStorage(const std::string& path, bool create)
+        : bpm_storage(&fm_storage) {
+        if (create) {
+            std::remove(path.c_str());
+            require(fm_storage.createFile(path.c_str()), "createFile failed");
+        }
+        require(fm_storage.openFile(path.c_str(), fid_storage),
+                "openFile failed");
+    }
+
+    ~IndexStorage() {
+        if (closed) return;
+        bpm_storage.close();
+        fm_storage.closeFile(fid_storage);
+        closed = true;
+    }
+};
+
+struct TestBPT : private IndexStorage, public BPT {
+    TestBPT(const std::string& path, BPTMeta& meta)
+        : IndexStorage(path, true),
+          BPT(fid_storage, &bpm_storage, meta) {}
+
+    explicit TestBPT(const std::string& path)
+        : IndexStorage(path, false), BPT(fid_storage, &bpm_storage) {}
+};
+
 void writeKey(int value, char* key) {
     std::memset(key, 0, kKeySize);
     std::memcpy(key + kNullBytes, &value, sizeof(value));
@@ -320,12 +353,8 @@ void checkRanges(BPT& tree, const std::vector<Entry>& model,
     const bool combinations[][2] = {
         {true, true}, {true, false}, {false, true}, {false, false}};
     for (const auto& combination : combinations) {
-        SearchIter iter =
-            tree.SearchRange(lowerKey, upperKey, combination[0]);
-        // SearchRange currently has one inclusivity argument. It is used for
-        // the lower bound during positioning; set the iterator's upper-bound
-        // policy separately so all four boundary combinations are exercised.
-        iter.inclusive = combination[1];
+        SearchIter iter = tree.SearchRange(
+            lowerKey, upperKey, combination[0], combination[1]);
         std::vector<ull> actual;
         for (std::size_t count = 0;
              count <= model.size() && tree.Valid(iter); ++count) {
@@ -338,10 +367,10 @@ void checkRanges(BPT& tree, const std::vector<Entry>& model,
     }
 }
 
-BPT* createTree(const std::string& path, bool unique = false) {
+TestBPT* createTree(const std::string& path, bool unique = false) {
     std::remove(path.c_str());
     BPTMeta meta = makeMeta(unique);
-    BPT* tree = new BPT(const_cast<char*>(path.c_str()), meta);
+    TestBPT* tree = new TestBPT(path, meta);
     // The test macros force frequent leaf and internal splits.
     tree->L = TEST_T;
     tree->I = TEST_I;
@@ -350,9 +379,9 @@ BPT* createTree(const std::string& path, bool unique = false) {
     return tree;
 }
 
-BPT* createTreeWithMeta(const std::string& path, BPTMeta meta) {
+TestBPT* createTreeWithMeta(const std::string& path, BPTMeta meta) {
     std::remove(path.c_str());
-    BPT* tree = new BPT(const_cast<char*>(path.c_str()), meta);
+    TestBPT* tree = new TestBPT(path, meta);
     tree->L = TEST_T;
     tree->I = TEST_I;
     tree->Lmin = (tree->L + 1) / 2;
@@ -366,7 +395,7 @@ void checkFullScan(BPT& tree, const std::vector<Entry>& inserted) {
 
     char lower[kKeySize];
     writeKey(std::numeric_limits<int>::min(), lower);
-    SearchIter iter = tree.SearchRange(lower, nullptr, true);
+    SearchIter iter = tree.SearchRange(lower, nullptr, true, true);
     std::vector<Entry> actual;
     actual.reserve(expected.size());
 
@@ -390,11 +419,11 @@ void checkFullScan(BPT& tree, const std::vector<Entry>& inserted) {
 
 void testEmptyAndSingleEntry() {
     const std::string path = testPath("empty_single");
-    BPT* tree = createTree(path);
+    TestBPT* tree = createTree(path);
 
     char key[kKeySize];
     writeKey(7, key);
-    SearchIter empty = tree->SearchRange(key, nullptr, true);
+    SearchIter empty = tree->SearchRange(key, nullptr, true, true);
     require(!tree->Valid(empty) && !tree->Next(empty),
             "empty tree produced a range result");
 
@@ -404,7 +433,7 @@ void testEmptyAndSingleEntry() {
     require(tree->InsertEntry(key, insertedRid) == -1,
             "exact duplicate was accepted");
 
-    SearchIter iter = tree->SearchRange(key, key, true);
+    SearchIter iter = tree->SearchRange(key, key, true, true);
     require(tree->Valid(iter), "single entry was not found");
     require(iter.rec_rid == insertedRid,
             "single entry returned the wrong RID");
@@ -417,7 +446,7 @@ void testEmptyAndSingleEntry() {
 
 void testDuplicateAndExactDuplicate() {
     const std::string path = testPath("duplicates");
-    BPT* tree = createTree(path);
+    TestBPT* tree = createTree(path);
     std::vector<Entry> inserted;
     char key[kKeySize];
 
@@ -448,7 +477,7 @@ void testDuplicateAndExactDuplicate() {
 
 void testExactDuplicateAtSearchBoundaries() {
     const std::string path = testPath("exact_search_boundaries");
-    BPT* tree = createTree(path);
+    TestBPT* tree = createTree(path);
     char key[kKeySize];
 
     // With two leaf entries, the second entry is the lower-bound result but
@@ -470,7 +499,7 @@ void testExactDuplicateAtSearchBoundaries() {
 
 void testUniqueIndex() {
     const std::string path = testPath("unique");
-    BPT* tree = createTree(path, true);
+    TestBPT* tree = createTree(path, true);
     char first[kKeySize];
     char second[kKeySize];
     writeKey(42, first);
@@ -483,7 +512,7 @@ void testUniqueIndex() {
 
     delete tree;
 
-    BPT reopened(const_cast<char*>(path.c_str()));
+    TestBPT reopened(path);
     reopened.L = TEST_T;
     reopened.I = TEST_I;
     reopened.Lmin = (reopened.L + 1) / 2;
@@ -506,7 +535,7 @@ void testNullKeysAcrossLeavesAndPersistence() {
     writeNullKey(nullKey);
 
     {
-        BPT* tree = createTree(path);
+        TestBPT* tree = createTree(path);
 
         // Insert in reverse RID order so the test also verifies that NULL keys
         // are ordered by RID and survive leaf/internal splits.
@@ -527,7 +556,7 @@ void testNullKeysAcrossLeavesAndPersistence() {
         require(validateTree(*tree) >= 3,
                 "NULL-key fixture did not split into a multi-level tree");
 
-        SearchIter all = tree->SearchRange(nullKey, nullptr, true);
+        SearchIter all = tree->SearchRange(nullKey, nullptr, true, true);
         std::vector<Entry> actual;
         while (tree->Valid(all)) {
             int value = 0;
@@ -541,7 +570,7 @@ void testNullKeysAcrossLeavesAndPersistence() {
         require(actual == expected,
                 "full scan did not order NULL keys before non-NULL keys");
 
-        SearchIter onlyNull = tree->SearchRange(nullKey, nullKey, true);
+        SearchIter onlyNull = tree->SearchRange(nullKey, nullKey, true, true);
         std::vector<ull> nullRids;
         while (tree->Valid(onlyNull)) {
             require(KeyColumnIsNull(onlyNull.key, 0),
@@ -564,12 +593,12 @@ void testNullKeysAcrossLeavesAndPersistence() {
         delete tree;
     }
 
-    BPT reopened(const_cast<char*>(path.c_str()));
+    TestBPT reopened(path);
     reopened.L = TEST_T;
     reopened.I = TEST_I;
     reopened.Lmin = (reopened.L + 1) / 2;
     reopened.Imin = (reopened.I + 1) / 2;
-    SearchIter onlyNull = reopened.SearchRange(nullKey, nullKey, true);
+    SearchIter onlyNull = reopened.SearchRange(nullKey, nullKey, true, true);
     std::vector<ull> reopenedRids;
     while (reopened.Valid(onlyNull)) {
         reopenedRids.push_back(onlyNull.rec_rid);
@@ -588,12 +617,12 @@ void testNullKeysAcrossLeavesAndPersistence() {
                 "NULL-key deletion failed during rebalance");
         validateTree(reopened);
     }
-    SearchIter noNulls = reopened.SearchRange(nullKey, nullKey, true);
+    SearchIter noNulls = reopened.SearchRange(nullKey, nullKey, true, true);
     require(!reopened.Valid(noNulls),
             "NULL equality range remained nonempty after deleting all NULLs");
     char firstValue[kKeySize];
     writeKey(1, firstValue);
-    SearchIter remaining = reopened.SearchRange(firstValue, nullptr, true);
+    SearchIter remaining = reopened.SearchRange(firstValue, nullptr, true, true);
     int remainingCount = 0;
     while (reopened.Valid(remaining)) {
         ++remainingCount;
@@ -606,7 +635,7 @@ void testNullKeysAcrossLeavesAndPersistence() {
 
 void testUniqueAllowsNullKeys() {
     const std::string path = testPath("unique_null");
-    BPT* tree = createTree(path, true);
+    TestBPT* tree = createTree(path, true);
     char nullKey[kKeySize];
     char valueKey[kKeySize];
     writeNullKey(nullKey);
@@ -654,7 +683,7 @@ void testCompositeUniqueNullSemantics() {
     meta.offset[0] = 1;
     meta.offset[1] = 1 + static_cast<int>(sizeof(int));
     meta.offset[2] = 1 + 2 * static_cast<int>(sizeof(int));
-    BPT* tree = new BPT(const_cast<char*>(path.c_str()), meta);
+    TestBPT* tree = new TestBPT(path, meta);
     tree->L = TEST_T;
     tree->I = TEST_I;
     tree->Lmin = (tree->L + 1) / 2;
@@ -683,7 +712,7 @@ void testCompositeUniqueNullSemantics() {
     require(tree->InsertEntry(nonNull, RID(27, 6)) == -2,
             "composite unique index accepted a duplicate non-NULL key");
 
-    SearchIter scan = tree->SearchRange(allNull, nullptr, true);
+    SearchIter scan = tree->SearchRange(allNull, nullptr, true, true);
     std::vector<ull> actualOrder;
     while (tree->Valid(scan)) {
         actualOrder.push_back(scan.rec_rid);
@@ -714,7 +743,7 @@ void testNullBitmapAcrossByteBoundary() {
         meta.type[i] = 0;
         meta.offset[i + 1] = meta.offset[i] + sizeof(int);
     }
-    BPT* tree = createTreeWithMeta(path, meta);
+    TestBPT* tree = createTreeWithMeta(path, meta);
 
     auto writeWideKey = [&](char* key, int nullColumn) {
         std::memset(key, 0, wideKeySize);
@@ -760,7 +789,7 @@ void testNullBitmapAcrossByteBoundary() {
     require(tree->meta.root != 1,
             "wide NULL-bitmap fixture did not exercise a leaf split");
 
-    SearchIter scan = tree->SearchRange(allNull, nullptr, true);
+    SearchIter scan = tree->SearchRange(allNull, nullptr, true, true);
     int count = 0;
     while (tree->Valid(scan)) {
         ++count;
@@ -782,7 +811,7 @@ void testFloatKeyOrderingAndRanges() {
     meta.type[0] = 1;
     meta.offset[0] = 1;
     meta.offset[1] = floatKeySize;
-    BPT* tree = createTreeWithMeta(path, meta);
+    TestBPT* tree = createTreeWithMeta(path, meta);
 
     auto writeFloatKey = [](double value, char* key) {
         std::memset(key, 0, floatKeySize);
@@ -809,7 +838,7 @@ void testFloatKeyOrderingAndRanges() {
 
     char lower[floatKeySize];
     writeFloatKey(-std::numeric_limits<double>::infinity(), lower);
-    SearchIter scan = tree->SearchRange(lower, nullptr, true);
+    SearchIter scan = tree->SearchRange(lower, nullptr, true, true);
     std::vector<FloatEntry> actual;
     while (tree->Valid(scan)) {
         double value = 0;
@@ -824,7 +853,7 @@ void testFloatKeyOrderingAndRanges() {
     char rangeUpper[floatKeySize];
     writeFloatKey(-2.25, rangeLower);
     writeFloatKey(3.5, rangeUpper);
-    SearchIter range = tree->SearchRange(rangeLower, rangeUpper, true);
+    SearchIter range = tree->SearchRange(rangeLower, rangeUpper, true, true);
     std::vector<FloatEntry> ranged;
     while (tree->Valid(range)) {
         double value = 0;
@@ -856,7 +885,7 @@ void testVarcharKeyOrderingAndRanges() {
     meta.type[0] = 2;
     meta.offset[0] = 1;
     meta.offset[1] = varcharKeySize;
-    BPT* tree = createTreeWithMeta(path, meta);
+    TestBPT* tree = createTreeWithMeta(path, meta);
 
     auto writeVarcharKey = [](const std::string& value, char* key) {
         std::memset(key, 0, varcharKeySize);
@@ -888,7 +917,7 @@ void testVarcharKeyOrderingAndRanges() {
 
     char lower[varcharKeySize];
     writeVarcharKey("", lower);
-    SearchIter scan = tree->SearchRange(lower, nullptr, true);
+    SearchIter scan = tree->SearchRange(lower, nullptr, true, true);
     std::vector<StringEntry> actual;
     while (tree->Valid(scan)) {
         actual.emplace_back(readVarcharKey(scan.key), scan.rec_rid);
@@ -902,8 +931,7 @@ void testVarcharKeyOrderingAndRanges() {
     char rangeUpper[varcharKeySize];
     writeVarcharKey("aa", rangeLower);
     writeVarcharKey("b", rangeUpper);
-    SearchIter range = tree->SearchRange(rangeLower, rangeUpper, true);
-    range.inclusive = false;
+    SearchIter range = tree->SearchRange(rangeLower, rangeUpper, true, false);
     std::vector<StringEntry> ranged;
     while (tree->Valid(range)) {
         ranged.emplace_back(readVarcharKey(range.key), range.rec_rid);
@@ -925,7 +953,7 @@ void testVarcharKeyOrderingAndRanges() {
 void runNodeCapacityCase(int leafCapacity, int internalCapacity,
                          const char* caseName) {
     const std::string path = testPath(caseName);
-    BPT* tree = createTree(path);
+    TestBPT* tree = createTree(path);
     tree->L = leafCapacity;
     tree->I = internalCapacity;
     tree->Lmin = (tree->L + 1) / 2;
@@ -1002,7 +1030,7 @@ void testMultiLevelSplitsAndPersistence() {
     const std::string path = testPath("multilevel");
     std::vector<Entry> inserted;
     {
-        BPT* tree = createTree(path);
+        TestBPT* tree = createTree(path);
         char key[kKeySize];
 
         for (int i = 0; i < 80; ++i) {
@@ -1022,7 +1050,7 @@ void testMultiLevelSplitsAndPersistence() {
         delete tree;
     }
 
-    BPT reopened(const_cast<char*>(path.c_str()));
+    TestBPT reopened(path);
     reopened.L = TEST_T;
     reopened.I = TEST_I;
     reopened.Lmin = (reopened.L + 1) / 2;
@@ -1038,7 +1066,7 @@ void testFreeListPersistenceAndReuse() {
     int persistedFreeHead = 0;
 
     {
-        BPT* tree = createTree(path);
+        TestBPT* tree = createTree(path);
         std::vector<Entry> entries;
         char key[kKeySize];
         for (int i = 0; i < kEntryCount; ++i) {
@@ -1081,7 +1109,7 @@ void testFreeListPersistenceAndReuse() {
     }
 
     {
-        BPT reopened(const_cast<char*>(path.c_str()));
+        TestBPT reopened(path);
         reopened.L = TEST_T;
         reopened.I = TEST_I;
         reopened.Lmin = (reopened.L + 1) / 2;
@@ -1125,8 +1153,8 @@ std::vector<ull> scanRange(BPT& tree, int lower, bool lowerInclusive,
     char upperKey[kKeySize];
     writeKey(lower, lowerKey);
     writeKey(upper, upperKey);
-    SearchIter iter = tree.SearchRange(lowerKey, upperKey, lowerInclusive);
-    iter.inclusive = upperInclusive;
+    SearchIter iter = tree.SearchRange(lowerKey, upperKey, lowerInclusive,
+                                       upperInclusive);
     std::vector<ull> result;
     while (tree.Valid(iter)) {
         result.push_back(iter.rec_rid);
@@ -1139,7 +1167,7 @@ std::vector<ull> scanRange(BPT& tree, int lower, bool lowerInclusive,
 
 void testRangeBoundaries() {
     const std::string path = testPath("ranges");
-    BPT* tree = createTree(path);
+    TestBPT* tree = createTree(path);
     char key[kKeySize];
     std::map<ull, int> values;
 
@@ -1192,15 +1220,15 @@ void testRangeBoundaries() {
                 scanRange(*tree, 5, false, 5, false).empty(),
             "open singleton range was not empty");
 
-    // Exercise Next's own upper-bound guard even when the caller does not
-    // invoke Valid before advancing an already out-of-range cursor.
+    // SearchRange may position at a physical entry outside the requested
+    // upper bound. Valid is the range guard in the current iterator contract.
     char low[kKeySize];
     char high[kKeySize];
     writeKey(8, low);
     writeKey(3, high);
-    SearchIter invalid = tree->SearchRange(low, high, true);
-    require(!tree->Next(invalid) && !tree->Valid(invalid),
-            "Next did not stop an already out-of-range cursor");
+    SearchIter invalid = tree->SearchRange(low, high, true, true);
+    require(!tree->Valid(invalid),
+            "Valid accepted a cursor beyond the upper range bound");
 
     delete tree;
     std::remove(path.c_str());
@@ -1208,7 +1236,7 @@ void testRangeBoundaries() {
 
 void testDuplicateRangeBoundaries() {
     const std::string path = testPath("duplicate_ranges");
-    BPT* tree = createTree(path);
+    TestBPT* tree = createTree(path);
     const std::vector<Entry> inserted = {
         {3, RID(15, 8)}, {3, RID(15, 2)}, {3, RID(15, 5)},
         {4, RID(15, 7)}, {4, RID(15, 1)}, {5, RID(15, 4)},
@@ -1238,7 +1266,7 @@ void testDuplicateRangeBoundaries() {
 
 void testManyDuplicatesAcrossLeaves() {
     const std::string path = testPath("many_duplicates");
-    BPT* tree = createTree(path);
+    TestBPT* tree = createTree(path);
     std::vector<Entry> model;
     char key[kKeySize];
 
@@ -1276,7 +1304,7 @@ void testManyDuplicatesAcrossLeaves() {
     char upper[kKeySize];
     writeKey(42, lower);
     writeKey(42, upper);
-    SearchIter iter = tree->SearchRange(lower, upper, true);
+    SearchIter iter = tree->SearchRange(lower, upper, true, true);
     std::vector<ull> actual;
     while (tree->Valid(iter)) {
         actual.push_back(iter.rec_rid);
@@ -1291,7 +1319,7 @@ void testManyDuplicatesAcrossLeaves() {
 
 void testDeleteAndRebalance() {
     const std::string path = testPath("delete_rebalance");
-    BPT* tree = createTree(path);
+    TestBPT* tree = createTree(path);
     std::vector<Entry> remaining;
     char key[kKeySize];
 
@@ -1334,7 +1362,7 @@ void testDeleteAndRebalance() {
 
 void testDeterministicMixedOperations() {
     const std::string path = testPath("mixed_operations");
-    BPT* tree = createTree(path);
+    TestBPT* tree = createTree(path);
     std::vector<Entry> model;
     char key[kKeySize];
     unsigned state = 0x13579bdfU;
@@ -1381,7 +1409,7 @@ void testDeterministicMixedOperations() {
 
 void testFourLevelBoundaryOperations() {
     const std::string path = testPath("four_level_boundaries");
-    BPT* tree = createTree(path);
+    TestBPT* tree = createTree(path);
     std::vector<Entry> model;
     char key[kKeySize];
     unsigned ridNumber = 1;
@@ -1494,7 +1522,7 @@ void testSplitInsertionOrders() {
 
     for (std::size_t pattern = 0; pattern < names.size(); ++pattern) {
         const std::string path = testPath(("split_" + names[pattern]).c_str());
-        BPT* tree = createTree(path);
+        TestBPT* tree = createTree(path);
         std::vector<int> values;
         values.reserve(kEntryCount);
         if (pattern == 0) {
@@ -1553,7 +1581,7 @@ void testSplitInsertionOrders() {
 
 void testLongRandomizedRebalance() {
     const std::string path = testPath("long_random_rebalance");
-    BPT* tree = createTree(path);
+    TestBPT* tree = createTree(path);
     std::vector<Entry> model;
     char key[kKeySize];
     unsigned state = 0x7f4a7c15U;
