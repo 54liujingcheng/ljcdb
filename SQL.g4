@@ -15,11 +15,20 @@ Sum: 'SUM';
 Null: 'NULL';
 
 Identifier: [a-zA-Z_] [a-zA-Z_0-9]*;
-Integer: [0-9]+;
-String:  '\'' (~'\'')* '\'';
-Float: ('-')? [0-9]+ '.' [0-9]*;
+UnsignedInteger: [0-9]+;
+String: '\'' ~['\r\n]* '\'';
+Float
+    : '-'? (
+        [0-9]+ '.' [0-9]* ExponentPart?
+        | '.' [0-9]+ ExponentPart?
+        | [0-9]+ ExponentPart
+    )
+    ;
+Minus: '-';
 Whitespace: [ \t\n\r]+ -> skip;
-Annotation: '-' '-' (~';')+;
+LineComment: '--' ~[\r\n]* -> skip;
+
+fragment ExponentPart: [eE] [+-]? [0-9]+;
 
 program
     : statement* EOF
@@ -29,7 +38,6 @@ statement
     : db_statement ';'
     | table_statement ';'
     | alter_statement ';'
-    | Annotation ';'
     | Null ';'
     ;
 
@@ -49,12 +57,32 @@ table_statement
     | 'LOAD' 'DATA' 'INFILE' String 'INTO' 'TABLE' Identifier 'FIELDS' 'TERMINATED' 'BY' String     # load_table
     | 'INSERT' 'INTO' Identifier 'VALUES' value_lists                                               # insert_into_table
     | 'DELETE' 'FROM' Identifier ('WHERE' where_and_clause)?                                        # delete_from_table
-    | 'UPDATE' Identifier 'SET' set_clause 'WHERE' where_and_clause                                 # update_table
+    | 'UPDATE' Identifier 'SET' set_clause ('WHERE' where_and_clause)?                               # update_table
     | select_table                                                                                  # select_table_
     ;
 
 select_table
-    : 'SELECT' selectors 'FROM' identifiers ('WHERE' where_and_clause)? ('GROUP' 'BY' column)? ('ORDER' 'BY' column (order)?)? ('LIMIT' Integer ('OFFSET' Integer)?)?
+    : 'SELECT' selectors 'FROM' identifiers where_part? group_by_part? order_by_part? limit_part?
+    ;
+
+where_part
+    : 'WHERE' where_and_clause
+    ;
+
+group_by_part
+    : 'GROUP' 'BY' column_list
+    ;
+
+order_by_part
+    : 'ORDER' 'BY' order_item (',' order_item)*
+    ;
+
+order_item
+    : column order?
+    ;
+
+limit_part
+    : 'LIMIT' UnsignedInteger ('OFFSET' UnsignedInteger)?
     ;
 
 alter_statement
@@ -75,12 +103,15 @@ field
     : Identifier type_ ('NOT' Null)? ('DEFAULT' value)?                                               # normal_field
     | 'PRIMARY' 'KEY' (Identifier)? '(' identifiers ')'                                               # primary_key_field
     | 'FOREIGN' 'KEY' (Identifier)? '(' identifiers ')' 'REFERENCES' Identifier '(' identifiers ')'   # foreign_key_field
+    | 'UNIQUE' (Identifier)? '(' identifiers ')'                                                      # unique_field
     ;
 
 type_
     : 'INT'
-    | 'VARCHAR' '(' Integer ')'
+    | ('VARCHAR' | 'CHAR') '(' UnsignedInteger ')'
     | 'FLOAT'
+    | 'DOUBLE'
+    | 'DATE'
     ;
 
 order
@@ -97,10 +128,14 @@ value_list
     ;
 
 value
-    : Integer
+    : signed_integer
     | String
     | Float
     | Null
+    ;
+
+signed_integer
+    : Minus? UnsignedInteger
     ;
 
 where_and_clause
@@ -109,6 +144,7 @@ where_and_clause
 
 where_clause
     : column operator_ expression            # where_operator_expression
+    | value operator_ column                 # where_value_operator_column
     | column operator_ '(' select_table ')'  # where_operator_select
     | column 'IS' ('NOT')? Null              # where_null
     | column 'IN' value_list                 # where_in_list
@@ -126,7 +162,11 @@ expression
     ;
 
 set_clause
-    : Identifier EqualOrAssign value (',' Identifier EqualOrAssign value)*
+    : assignment (',' assignment)*
+    ;
+
+assignment
+    : column EqualOrAssign value
     ;
 
 selectors
@@ -142,6 +182,10 @@ selector
 
 identifiers
     : Identifier (',' Identifier)*
+    ;
+
+column_list
+    : column (',' column)*
     ;
 
 operator_

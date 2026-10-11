@@ -152,54 +152,6 @@ struct BPT{
         bpm->markDirty(index);
         return ;
     }
-    #ifdef TEST_OLD
-    FileManager* fm;
-    BPT(char* path){
-        fm = new FileManager();
-        bpm = new BufPageManager(fm);
-        fm->openFile(path,fid);
-        int index;
-        BufType metapage = bpm->getPage(fid,0,index);
-        memcpy(static_cast<void*>(&meta),metapage,sizeof(meta));
-        keylen = meta.offset[meta.col];
-        nullen = (meta.col+7)/8;
-        offset_inter = keylen+12;
-        offset_leaf = keylen+8;
-        #ifndef TEST
-        L = (PAGE_SIZE - PAGEMETA) / (keylen + 8);
-        I = (PAGE_SIZE - PAGEMETA) / (keylen + 12);
-        #else
-        L = TEST_L;
-        I = TEST_I;
-        #endif
-        Lmin = (L+1)/2, Imin = (I+1)/2;
-    }
-    BPT(char* path,BPTMeta& meta2){
-        fm = new FileManager();
-        bpm = new BufPageManager(fm);
-        fm->createFile(path);
-        fm->openFile(path,fid);
-        int index;
-        BufType metapage = bpm->allocPage(fid,0,index,false);
-        memset(metapage,0,PAGE_SIZE);
-        memcpy(metapage,&meta2,BPTMETA);
-        meta = meta2;
-        bpm->markDirty(index);
-        keylen = meta.offset[meta.col];
-        nullen = (meta.col+7)/8;
-        offset_inter = keylen+12;
-        offset_leaf = keylen+8;
-        #ifndef TEST
-        L = (PAGE_SIZE - PAGEMETA) / (keylen + 8);
-        I = (PAGE_SIZE - PAGEMETA) / (keylen + 12);
-        #else
-        L = TEST_L;
-        I = TEST_I;
-        #endif
-        Lmin = (L+1)/2, Imin = (I+1)/2;
-        AllocPage(0);
-    }
-    #endif
     BPT(int fid, BufPageManager* _bpm){
         bpm = _bpm;
         this->fid = fid;

@@ -1,4 +1,5 @@
 #include "system_management.h"
+#include <charconv>
 int serialization(Row& src, char* dest, Schema& sc){
     memset(dest,0,sc.recordsize);
     int nullen = sc.nullen, col = sc.col, j = nullen;
@@ -122,4 +123,49 @@ int index_deserialization(char* src, Row& dest, Schema& sc, Index* idx){
         j += desc.len;
     }
     return 0;
+}
+int LoadCSV(DbManager& dbm, string table_name, string load_path){
+    FILE* f = fopen(load_path.c_str(), "rb");
+    int cnt=0;
+    if(!f)return 0;
+    if(!dbm.name_table.count(table_name))return 0;
+    Table* tb = dbm.name_table[table_name];
+    Schema& sc = tb->mng->tbmeta.schema;
+    Row row;
+    row.reserve(sc.col);
+    vector<Index*> indexes= dbm.id_normidx[tb->id];
+    char buf[4096];
+    if(tb->pkid != -1)indexes.push_back(dbm.id_idx[tb->pkid]);
+    while(fgets(buf, sizeof(buf), f) != NULL){
+        int cursor = 0;
+        for(int i=0;i<sc.col;i++){
+            int old_cursor = (i == 0?0:cursor+1);
+            while(buf[cursor] != ',' && buf[cursor] != '\r' && buf[cursor] != '\n' && buf[cursor] != '\0'){
+                    cursor++;
+            }
+            buf[cursor] = '\0';
+            if(strcmp(buf+old_cursor, "NULL") == 0)row.push_back((bool)false);
+            else if(sc.desc[i].type==0){
+                int val;
+                from_chars(buf+old_cursor, buf+cursor, val);
+                row.push_back(val);
+            }else if(sc.desc[i].type == 1){
+                double val;
+                from_chars(buf+old_cursor, buf+cursor, val);
+                row.push_back(val);
+            }else if(sc.desc[i].type == 2){
+                string val(buf+old_cursor, buf+cursor);
+                row.push_back(val);
+            }else if(sc.desc[i].type == 3){
+                DATE val{(buf[0+old_cursor]-'0')*10000000+(buf[1+old_cursor]-'0')*1000000+(buf[2+old_cursor]-'0')*100000+
+                    (buf[3+old_cursor]-'0')*10000+(buf[5+old_cursor]-'0')*1000+(buf[6+old_cursor]-'0')*100+(buf[8+old_cursor]-'0')*10+buf[9+old_cursor]-'0'};
+                row.push_back(val);
+            }
+        }
+        dbm.InsertRow_raw(row, tb, sc, indexes);
+        row.clear();
+        cnt++;
+    }
+    fclose(f);
+    return cnt;
 }

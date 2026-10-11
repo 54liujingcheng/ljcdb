@@ -1,0 +1,2 @@
+third_party/antlr4_runtime/** linguist-vendored
+parser/generated/** linguist-generated

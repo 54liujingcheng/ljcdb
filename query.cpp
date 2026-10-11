@@ -41,7 +41,7 @@ BoundInsertRequest BindingInsertRequest(DbManager& dbm,UnboundInsertRequest& req
         for(int j=0;j<rows[i].size();j++){
             int type = sc.desc[j].type, nullable = sc.desc[j].nullable;
             if(holds_alternative<bool>(rows[i][j]) && !nullable){
-                return BoundInsertRequest{table_id, req.rows, ERR_ELSE};
+                return BoundInsertRequest{table_id, req.rows, ERR_NULL};
             }
             if(holds_alternative<int>(rows[i][j]) && type != 0){
                 return BoundInsertRequest{table_id, req.rows, ERR_ELSE};
@@ -564,7 +564,7 @@ static bool CanUseINLJ(Index* idx,int inner_table_id,const Operator& outer,const
     return true;
 }
 unique_ptr<Operator> Planner(DbManager* dbm, BoundSelectRequest& bsr){//记得有聚合的时候不用Project
-    if(bsr.errorcode!=0 || bsr.table_ids.empty())return nullptr;
+    if(bsr.errorcode!=OK || bsr.table_ids.empty())return nullptr;
     unique_ptr<Operator> root = nullptr;
     bool has_agg=0;
     for(auto i:bsr.col_items){
@@ -655,28 +655,6 @@ unique_ptr<Operator> Planner(DbManager* dbm, BoundSelectRequest& bsr){//记得�
         }
         if(tmp.size()>0)root = make_unique<Filter>(dbm, move(root), tmp);
         tids.insert(i);
-        /*for(int ii=bsr.table_ids.size()-2;ii>=0;ii--){
-            int i = bsr.table_ids[ii];
-            unique_ptr<Operator>tmptr = ScanMother(dbm, bsr.conditions, i);
-            vector<Condition> tmp,tmp2;
-            for(auto& j:bsr.conditions){
-                if(j.type == ConditionType::COMPARE){
-                    if((j.left.is_val || j.left.col.table_id == i) && (j.right.is_val || j.right.col.table_id == i)){
-                        tmp.push_back(j);
-                    }
-                    else if((!j.left.is_val && !j.right.is_val) && (j.left.col.table_id == i && tids.count(j.right.col.table_id) || j.right.col.table_id == i && tids.count(j.left.col.table_id))){
-                        tmp2.push_back(j);
-                    }
-                }
-                else{
-                    if(j.left.col.table_id == i)tmp.push_back(j);
-                }
-            }
-            if(tmp.size()>0)tmptr = make_unique<Filter>(dbm, move(tmptr), tmp);
-            tmp.clear();
-            root = make_unique<BNLJ>(dbm, move(tmptr), move(root), tmp2);
-            tids.insert(i);
-        }*/
         for (int ii = bsr.table_ids.size()-2;ii >= 0;--ii) {
             int inner_table_id = bsr.table_ids[ii];
             vector<Condition> local_conditions;
@@ -1012,4 +990,174 @@ int tuple_serialization(Row& src, vector<char>& dest, vector<SlotType>& slots, i
         j += desc.len;
     }
     return 0;
+}
+pair<int,int> InsertExecuter(DbManager& dbm, BoundInsertRequest& bir){
+    if(bir.errorcode!=OK)return {0,bir.errorcode};
+    int cnt=0;
+    if(!dbm.id_table.count(bir.table_id))return {0,ERR_ELSE};
+    Table* tb = dbm.id_table[bir.table_id];
+    vector<ull> rids;
+    for(int i=0;i<bir.rows.size();i++){
+        ull res = dbm.InsertRow(tb, bir.rows[i]);
+        if(res < 10){
+            for(int j=cnt-1;j>=0;j--)dbm.DeleteApply(tb, rids[j]);
+            return {0,res};
+        }
+        rids.push_back(res);
+        cnt++;
+    }
+    return {cnt,0};
+}
+pair<int,int> DeleteExecuter(DbManager& dbm, BoundDeleteRequest& bdr){
+    if(bdr.errorcode!=OK)return {0,bdr.errorcode};
+    unique_ptr<Operator> root = nullptr;
+    for(auto& i:bdr.conditions){
+        if(i.type == ConditionType::SUB_COMPARE){
+            unique_ptr<Operator> root = Planner(&dbm, *(i.sub));
+            Tuple input;
+            if(root == nullptr || root->Open())return {0,ERR_ELSE};
+            int res = root->Next(input);
+            if(res == -1 || res == 1){
+                root->Close();
+                return {0,ERR_ELSE};
+            }
+            i.type = ConditionType::COMPARE;
+            i.right.is_val = true;
+            i.right.val = input.values[0];
+            root->Close();
+        }
+        else if(i.type == ConditionType::SUB_IN){
+            unique_ptr<Operator> root = Planner(&dbm, *(i.sub));
+            Tuple input;
+            if(root == nullptr || root->Open())return {0,ERR_ELSE};
+            while(1){
+                int res = root->Next(input);
+                if(res == -1){
+                    root->Close();
+                    return {0,ERR_ELSE};
+                }
+                if(res == 1){
+                    root->Close();
+                    break;
+                }
+                i.values.push_back(input.values[0]);
+            }
+            i.type = ConditionType::IN_LIST;
+            root->Close();
+        }
+    }
+    root = ScanMother(&dbm, bdr.conditions, bdr.table_id);
+    
+    if(bdr.conditions.size()>0)root = make_unique<Filter>(&dbm, move(root), bdr.conditions);
+    vector<ull> rids;
+    Tuple output;
+    Table* tb = dbm.id_table[bdr.table_id];
+    int cnt=0;
+    if(root->Open()){
+        root->Close();
+        return {0,ERR_ELSE};
+    }
+    while(1){
+        int res = root->Next(output);
+        if(res == -1)return {0,ERR_ELSE};
+        if(res == 1)break;
+        if(output.rid)rids.push_back(output.rid.value());
+    }
+    root->Close();
+    for(int i=0;i<rids.size();i++){
+        int res = dbm.DeleteValid(tb, rids[i]);
+        if(res != 0)return {0,res};
+    }
+    for(int i=0;i<rids.size();i++){
+        int res = dbm.DeleteApply(tb, rids[i]);
+        if(res!=0)return {cnt,res};
+        cnt++;
+    }
+    return {cnt,OK};
+}
+pair<int,int> UpdateExecuter(DbManager& dbm, BoundUpdateRequest& bur){
+    if(bur.errorcode!=OK)return {0,bur.errorcode};
+    unique_ptr<Operator> root = nullptr;
+    for(auto& i:bur.conditions){
+        if(i.type == ConditionType::SUB_COMPARE){
+            unique_ptr<Operator> root = Planner(&dbm, *(i.sub));
+            Tuple input;
+            if(root == nullptr || root->Open())return {0,ERR_ELSE};
+            int res = root->Next(input);
+            if(res == -1 || res == 1){
+                root->Close();
+                return {0,ERR_ELSE};
+            }
+            i.type = ConditionType::COMPARE;
+            i.right.is_val = true;
+            i.right.val = input.values[0];
+            root->Close();
+        }
+        else if(i.type == ConditionType::SUB_IN){
+            unique_ptr<Operator> root = Planner(&dbm, *(i.sub));
+            Tuple input;
+            if(root == nullptr || root->Open())return {0,ERR_ELSE};
+            while(1){
+                int res = root->Next(input);
+                if(res == -1){
+                    root->Close();
+                    return {0,ERR_ELSE};
+                }
+                if(res == 1){
+                    root->Close();
+                    break;
+                }
+                i.values.push_back(input.values[0]);
+            }
+            i.type = ConditionType::IN_LIST;
+            root->Close();
+        }
+    }
+    root = ScanMother(&dbm, bur.conditions, bur.table_id);
+    
+    if(bur.conditions.size()>0)root = make_unique<Filter>(&dbm, move(root), bur.conditions);
+    vector<ull> rids;
+    Tuple output;
+    Table* tb = dbm.id_table[bur.table_id];
+    int cnt=0;
+    if(root->Open())return {0,ERR_ELSE};
+    while(1){
+        int res = root->Next(output);
+        if(res == -1)return {0,ERR_ELSE};
+        if(res == 1)break;
+        if(output.rid)rids.push_back(output.rid.value());
+    }
+    root->Close();
+    vector<int> cid;
+    Row row = bur.values;
+    for(auto& i:bur.col){
+        cid.push_back(i.cid);
+    }
+    Schema& sc = tb->mng->tbmeta.schema;
+    int recsize = sc.recordsize;
+    for(int i=0;i<rids.size();i++){
+        int res = dbm.UpdateValid(tb, rids[i], cid, row);
+        if(res != 0)return {0,res};
+        vector<Index*> indexes;
+        if(tb->pkid!=-1)indexes.push_back(dbm.id_idx.at(tb->pkid));
+        if(dbm.id_normidx.count(tb->id)){
+            for(Index* index:dbm.id_normidx[tb->id])if(index->uni)indexes.push_back(index);
+        }
+        for(auto j : indexes){
+            for(int k : j->cid){
+                for(int t:cid){
+                    if(k==t&&rids.size()>1&&j->cid.size()==1)return {0,ERR_DUPULICATE};
+                }
+            }
+        }
+    }
+    for(int i=0;i<rids.size();i++){
+        bool changed = false;
+        int res = dbm.UpdateApply(tb, rids[i], cid, row, changed);
+        if(res!=0){
+            return {cnt, res};
+        }
+        if(changed)cnt++;
+    }
+    return {cnt,0};
 }

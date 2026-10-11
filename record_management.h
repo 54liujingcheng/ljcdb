@@ -41,7 +41,7 @@ struct Col{
     int len;
     int nullable;
     int defalutable;
-    int default_offset;//0 -> null
+    int default_offset;//-1 -> null
     //int default_len;
 };
 struct Schema{
@@ -64,36 +64,6 @@ struct RecordManager{
     int slotcapa;
     BufPageManager* bpm;
     TableMeta tbmeta;
-    #ifdef TEST_OLD
-    FileManager* fm;
-    RecordManager(char* path, Schema& sch){
-        fm = new FileManager();
-        bpm = new BufPageManager(fm);
-        fm->createFile(path);
-        fm->openFile(path,fid);
-        int index;
-        BufType tbmetapage = bpm->allocPage(fid,0,index,false);
-        tbmeta.head = tbmeta.page = 0;
-        memcpy(&tbmeta.schema,&sch,sizeof(Schema));
-        slotcapa = 8 * (PAGE_SIZE - 1 - DPOFFSET) / (9*tbmeta.schema.recordsize);
-        slotbit = ceil(slotcapa / 8.0);
-        offset = DPOFFSET + slotbit;
-        memcpy(tbmetapage,&tbmeta,sizeof(TableMeta));
-        bpm->markDirty(index);
-    }
-    RecordManager(char* path){
-        fm = new FileManager();
-        bpm = new BufPageManager(fm);
-        fm->openFile(path,fid);
-        int index;
-        BufType metapage = bpm->getPage(fid,0,index);
-        bpm->access(index);
-        memcpy(&tbmeta, metapage, sizeof(TableMeta));
-        slotcapa = 8 * (PAGE_SIZE - 1 - DPOFFSET) / (9*tbmeta.schema.recordsize);
-        slotbit = ceil(slotcapa / 8.0);
-        offset = DPOFFSET + slotbit;
-    }
-    #endif
     RecordManager(int fid, BufPageManager* _bpm){
         bpm = _bpm;
         this->fid = fid;
@@ -101,8 +71,8 @@ struct RecordManager{
         BufType metapage = bpm->getPage(fid,0,index);
         bpm->access(index);
         memcpy(&tbmeta, metapage, sizeof(TableMeta));
-        slotcapa = 8 * (PAGE_SIZE - 1 - DPOFFSET) / (9*tbmeta.schema.recordsize);
-        slotbit = ceil(slotcapa / 8.0);
+        slotcapa = 8 * (PAGE_SIZE - DPOFFSET) / (8*tbmeta.schema.recordsize + 1);
+        slotbit = (slotcapa+7)/8;
         offset = DPOFFSET + slotbit;
     }
     RecordManager(int fid, BufPageManager* _bpm, Schema& sch){
@@ -112,8 +82,8 @@ struct RecordManager{
         BufType tbmetapage = bpm->allocPage(fid,0,index,false);
         tbmeta.head = tbmeta.page = 0;
         memcpy(&tbmeta.schema,&sch,sizeof(Schema));
-        slotcapa = 8 * (PAGE_SIZE - 1 - DPOFFSET) / (9*tbmeta.schema.recordsize);
-        slotbit = ceil(slotcapa / 8.0);
+        slotcapa = 8 * (PAGE_SIZE - DPOFFSET) / (8*tbmeta.schema.recordsize + 1);
+        slotbit = (slotcapa+7)/8;
         offset = DPOFFSET + slotbit;
         memcpy(tbmetapage,&tbmeta,sizeof(TableMeta));
         bpm->markDirty(index);

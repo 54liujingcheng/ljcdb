@@ -92,7 +92,7 @@ struct UnboundInsertRequest{
 struct BoundInsertRequest{
     int table_id;
     vector<Row> rows;
-    int errorcode=0;//ok->0 dupilicate->1 foreign->2 primary->3 date->4 else->5 null->6
+    int errorcode=0;//ok->0 dupilicate->1 foreign->2 primary->3 date->4 null->5 else->6
 };
 BoundInsertRequest BindingInsertRequest(DbManager& dbm,UnboundInsertRequest& req);
 struct UnboundDeleteRequest{
@@ -152,7 +152,7 @@ struct Tuple{
     bool operator == (const Tuple& other) const {
         return other.values == values;
     }
-    
+    optional<ull> rid = nullopt;
 };
 namespace std {
     template <>
@@ -218,6 +218,7 @@ struct SeqScan : Operator{
         Schema& sc = tb->mng->tbmeta.schema;
         tb->mng->LoadRecord(rid, buf);
         deserialization(buf, output.values,sc);
+        output.rid = rid;
         rid = tb->mng->NextRecord(rid);
         return 0;
     }
@@ -607,9 +608,10 @@ struct IndexScan : Operator{
     int Next(Tuple& output){
         if(!opened)return -1;
         Schema& sc = tb->mng->tbmeta.schema;
-        if(idx->mng->Valid(iter)){
+        if(idx->mng->Valid(iter, 1)){
             tb->mng->LoadRecord(iter.rec_rid, buf);
             deserialization(buf,output.values , sc);
+            output.rid = iter.rec_rid;
             idx->mng->Next(iter);
             return 0;
         }
@@ -1337,3 +1339,6 @@ struct INLJ: Operator{
         opened = false;
     }
 };
+pair<int,int> InsertExecuter(DbManager& dbm, BoundInsertRequest& bir);
+pair<int,int> DeleteExecuter(DbManager& dbm, BoundDeleteRequest& bdr);
+pair<int,int> UpdateExecuter(DbManager& dbm, BoundUpdateRequest& bur);

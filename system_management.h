@@ -344,11 +344,11 @@ struct DbManager{
         }
         return tb;
     }
-    void DropTable(char* name){
-        if(!name_table.count(name))return ;
+    int DropTable(char* name){
+        if(!name_table.count(name))return ERR_ELSE;
         Table* tb = name_table[name];
         fs::path path = tb->file_name;
-        if(!fs::exists(path))return ;
+        if(!fs::exists(path))return ERR_ELSE;
         int id = tb -> id;
         while (id_infk.count(id) && !id_infk[id].empty()) {
             Foreign* f = id_infk[id].back();
@@ -373,6 +373,7 @@ struct DbManager{
         name_table.erase(name);
         id_table.erase(id);
         tb->name_cid.clear();
+        return OK;
     }
     Index* CreateIndex(char* tablename, char* indexname, int col, vector<int>& cid, int unique, int implicit, int type){
         if(!name_table.count(tablename) || col!=cid.size() || col<=0)return 0;
@@ -454,11 +455,11 @@ struct DbManager{
         if(flag)DropIndex(tablename,indexname),ix=0;
         return ix;
     }
-    void DropIndex(char* tablename, char* indexname){
+    int DropIndex(char* tablename, char* indexname){
         //外键哈希表在外键删除部分处理
-        if(name_table.count(tablename) == 0)return ;
+        if(name_table.count(tablename) == 0)return ERR_ELSE;
         Table* tb = name_table[tablename];
-        if(idname_idx.count({tb->id, indexname}) == 0)return ;
+        if(idname_idx.count({tb->id, indexname}) == 0)return ERR_ELSE;
         Index* ix = idname_idx[{tb->id, indexname}];
         for(int i=0;i<MAX_FK;i++){
             if(fkbm.test(i) && (fk[i].pa_idx_id == ix->id || fk[i].ch_idx_id == ix->id))
@@ -486,6 +487,7 @@ struct DbManager{
         fs::remove(path);
         idx_num --;
         idxbm.reset(ix-idx);
+        return OK;
     }
     Foreign* CreateForeign(char* _name, int pa_tableid, int ch_tableid, vector<int>& ccid){
         string __name;
@@ -561,9 +563,9 @@ struct DbManager{
         fkey->ch_idx_id = cix->id;
         return fkey;
     }
-    void DropForeign(char* table_name,char* foreign_name){
+    int DropForeign(char* table_name,char* foreign_name){
         Foreign* fkey=nullptr;
-        if(!name_table.count(table_name))return ;
+        if(!name_table.count(table_name))return ERR_ELSE;
         Table* tb = name_table[table_name];
         vector<Foreign*>& outfk = id_outfk[tb->id];
         for(int i=0;i<outfk.size();i++){
@@ -573,7 +575,7 @@ struct DbManager{
                 break;
             }
         }
-        if(!fkey)return ;
+        if(!fkey)return ERR_FORIEGN;
         auto& vec = id_outfk[fkey->ch_table_id];
         for (auto it = vec.begin(); it != vec.end(); ++it) {
             if ((*it)->id == fkey->id) {
@@ -594,6 +596,7 @@ struct DbManager{
         if(id_idx[fkey->ch_idx_id]->implicit == 1&& id_idx[fkey->ch_idx_id]->uni == 0&& id_idx[fkey->ch_idx_id]->type == 1){
                 DropIndex(table_name, id_idx[fkey->ch_idx_id]->name);
         }
+        return OK;
     }
     Row ReadRow(string table_name, ull rid){
         Row row;
@@ -614,9 +617,7 @@ struct DbManager{
             j+=len;
         }
     }
-    ull InsertRow(string table_name,Row& row){
-        if(!name_table.count(table_name))return ERR_ELSE;
-        Table* tb = name_table[table_name];
+    ull InsertRow(Table* tb,Row& row){
         Schema& sc = tb->mng->tbmeta.schema;
         vector<Index*> indexes;
         int recsize = sc.recordsize,col = row.size();
@@ -657,7 +658,7 @@ struct DbManager{
             if (!KeyHasNull(buf+recsize, childidx->col) &&!parentidx->mng->Exist(buf+recsize))return ERR_FORIEGN;
         }
         ull rid = tb->mng->InsertRecord(buf);
-        if(rid<=0)return 9;
+        if(rid<=0)return ERR_ELSE;
         vector<Index*> insertedIndexes;
         for (Index* index : indexes) {
             IntoIndexKey(buf, buf + recsize, sc, index->cid);
@@ -674,43 +675,42 @@ struct DbManager{
         }
         return rid;
     }
-    int DeleteRow(string table_name, ull rid){
-        if(!name_table.count(table_name))return ERR_ELSE;
-        Table* tb = name_table[table_name];
+    int DeleteValid(Table* tb, ull rid){
         Schema& sc = tb->mng->tbmeta.schema;
-        vector<Index*> indexes;
         int recsize = sc.recordsize;
         if(!tb->mng->isValid(rid))return ERR_ELSE;
         if(id_infk.count(tb->id) && !id_infk[tb->id].empty()){
             vector<Foreign*>& in = id_infk[tb->id];
+            tb->mng->LoadRecord(rid,buf);
             for(auto fk:in){
                 Index* chidx = id_idx[fk->ch_idx_id];
                 Index* paidx = id_idx[fk->pa_idx_id];
-                tb->mng->LoadRecord(rid,buf);
                 IntoIndexKey(buf,buf+recsize,sc,paidx->cid);
                 if(chidx->mng->Exist(buf+recsize))return ERR_FORIEGN;
             }
         }
+        return OK;
+    }
+    int DeleteApply(Table* tb, ull rid){
+        Schema& sc = tb->mng->tbmeta.schema;
+        vector<Index*> indexes;
+        int recsize = sc.recordsize;
         vector<Index*> deletedindexes;
         if(id_normidx.count(tb->id) && !id_normidx[tb->id].empty()){
             vector<Index*>& norm = id_normidx[tb->id];
             for(auto idx:norm){
-                tb->mng->LoadRecord(rid,buf);
-                IntoIndexKey(buf,buf+recsize,sc,idx->cid);
                 indexes.push_back(idx);
             }
         }
         if(tb->pkid != -1){
             Index* primary = id_idx[tb->pkid];
-            tb->mng->LoadRecord(rid,buf);
-            IntoIndexKey(buf,buf+recsize,sc,primary->cid);
             indexes.push_back(primary);
         }
+        tb->mng->LoadRecord(rid,buf);
         for (Index* index : indexes) {
             IntoIndexKey(buf, buf + recsize, sc, index->cid);
             if (index->mng->DeleteEntry(buf + recsize, rid) != 0) {
-                for (auto it = deletedindexes.rbegin();
-                    it != deletedindexes.rend(); ++it) {
+                for (auto it = deletedindexes.rbegin();it != deletedindexes.rend(); ++it) {
                     IntoIndexKey(buf, buf + recsize, sc, (*it)->cid);
                     (*it)->mng->InsertEntry(buf + recsize, rid);
                 }
@@ -721,55 +721,7 @@ struct DbManager{
         tb->mng->EraseRecord(rid);
         return OK;
     }
-    #ifdef TEST
-    int DeleteRows(string table_name, vector<ull>& vec){
-        if(!name_table.count(table_name))return 1;
-        Table* tb = name_table[table_name];
-        Schema& sc = tb->mng->tbmeta.schema;
-        int recsize = sc.recordsize;
-        for(auto rid:vec){
-            if(!tb->mng->isValid(rid))return 3;
-        }
-        if(id_infk.count(tb->id) && !id_infk[tb->id].empty()){
-            vector<Foreign*>& in = id_infk[tb->id];
-            for(auto fk:in){
-                for(auto rid:vec){
-                    Index* chidx = id_idx[fk->ch_idx_id];
-                    Index* paidx = id_idx[fk->pa_idx_id];
-                    tb->mng->LoadRecord(rid,buf);
-                    IntoIndexKey(buf,buf+recsize,sc,paidx->cid);
-                    if(chidx->mng->Exist(buf+recsize))return 2;
-                }
-            }
-        }
-        if(id_normidx.count(tb->id) && !id_normidx[tb->id].empty()){
-            vector<Index*>& norm = id_normidx[tb->id];
-            for(auto idx:norm){
-                for(auto rid:vec){
-                    tb->mng->LoadRecord(rid,buf);
-                    IntoIndexKey(buf,buf+recsize,sc,idx->cid);
-                    idx->mng->DeleteEntry(buf+recsize,rid);
-                }
-            }
-        }
-        if(tb->pkid != -1){
-            Index* primary = id_idx[tb->pkid];
-            for(auto rid:vec){
-                tb->mng->LoadRecord(rid,buf);
-                IntoIndexKey(buf,buf+recsize,sc,primary->cid);
-                primary->mng->DeleteEntry(buf+recsize,rid);
-            }
-        }
-        for(auto rid:vec){
-            tb->mng->EraseRecord(rid);
-        }
-        return 0;
-    }
-    #endif
-    int UpdateRow(string table_name, ull rid, vector<int>& cid, Row& row, bool& changed){
-        changed = false;
-        if(!name_table.count(table_name))return ERR_ELSE;
-        Table* tb = name_table[table_name];
+    int UpdateValid(Table* tb, ull rid, vector<int>& cid, Row& row){
         Schema& sc = tb->mng->tbmeta.schema;
         if (!tb->mng->isValid(rid))return ERR_ELSE;
         if (cid.size() != row.size())return ERR_ELSE;
@@ -844,13 +796,46 @@ struct DbManager{
                 }
             }
         }
+        return OK;
+    }
+    int UpdateApply(Table* tb, ull rid, vector<int>& cid, Row& row, bool& changed){
+        changed = false;
+        Schema& sc = tb->mng->tbmeta.schema;
+        int recsize = sc.recordsize;
+        char* oldRecord = buf, *newRecord = buf+recsize;
+        char* oldKey = buf+2*recsize, *newKey = buf+3*recsize;
+        tb->mng->LoadRecord(rid, oldRecord);
+        Row newRow;
+        deserialization(oldRecord,newRow,sc);
+        for(size_t i=0;i<cid.size();i++){
+            newRow[cid[i]]=row[i];
+        }
+        if(serialization(newRow, newRecord, sc))return ERR_ELSE;
+        if (memcmp(oldRecord, newRecord, recsize) == 0) {
+            return OK;
+        }
+        vector<Index*> indexes;
+        if(tb->pkid!=-1)indexes.push_back(id_idx.at(tb->pkid));
+        if(id_normidx.count(tb->id)){
+            for(Index* index:id_normidx[tb->id])indexes.push_back(index);
+        }
         vector<Index*> updatedIndexes;
         for(Index* index:indexes){
             IntoIndexKey(oldRecord,oldKey,sc,index->cid);
             IntoIndexKey(newRecord,newKey,sc,index->cid);
             if(index->mng->cmp(oldKey,newKey,0,0)==0)continue;
-            if(index->mng->InsertEntry(newKey,rid)!=0 ||
-               index->mng->DeleteEntry(oldKey,rid)!=0){
+            int res1 = index->mng->InsertEntry(newKey,rid);
+            if(res1!=0){
+                for(auto it=updatedIndexes.rbegin();it!=updatedIndexes.rend();++it){
+                    IntoIndexKey(oldRecord,oldKey,sc,(*it)->cid);
+                    IntoIndexKey(newRecord,newKey,sc,(*it)->cid);
+                    (*it)->mng->InsertEntry(oldKey,rid);
+                    (*it)->mng->DeleteEntry(newKey,rid);
+                }
+                return ERR_DUPULICATE;
+            }
+            int res2 = index->mng->DeleteEntry(oldKey,rid);
+            if(res2!=0){
                 index->mng->DeleteEntry(newKey,rid);
                 for(auto it=updatedIndexes.rbegin();it!=updatedIndexes.rend();++it){
                     IntoIndexKey(oldRecord,oldKey,sc,(*it)->cid);
@@ -866,7 +851,21 @@ struct DbManager{
         changed = true;
         return OK;
     }
+    ull InsertRow_raw(Row& row, Table* tb, Schema& sc, vector<Index*>& indexes){
+        //Table* tb = name_table[table_name];
+        //Schema& sc = tb->mng->tbmeta.schema;
+        //vector<Index*> indexes= id_normidx[tb->id];
+        int recsize = sc.recordsize;
+        serialization(row, buf, sc);
+        ull rid = tb->mng->InsertRecord(buf);
+        for (Index* index : indexes) {
+            IntoIndexKey(buf, buf + recsize, sc, index->cid);
+            index->mng->InsertEntry(buf + recsize, rid);
+        }
+        return rid;
+    }
 };
+int LoadCSV(DbManager& dbm, string table_name, string load_path);
 /*
 文件格式：
 /data/dbname
