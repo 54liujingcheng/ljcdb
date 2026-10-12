@@ -180,7 +180,7 @@ void runSQLJC(DbManager& dbm,string SQLJC, bool mode){//0->交互 1->批处理 o
                     printf("@\n");
                 }
                 else{
-                    printf("Tables\n");
+                    printf("Tables:\n");
                     for(auto& i:dbm.name_table){
                         printf("%s\n", i.first.c_str());
                     }

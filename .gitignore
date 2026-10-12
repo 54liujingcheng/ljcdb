@@ -2,6 +2,8 @@ dbs-tutorial-master/
 dbs-testcase-main/
 antlr-4.13.2-complete.jar
 tools/
+/data/
+/cmake-build-*/
 # =========================
 # 1. 操作系统生成的隐藏文件
 # =========================
