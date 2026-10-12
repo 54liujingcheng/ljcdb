@@ -1,6 +1,7 @@
 dbs-tutorial-master/
 dbs-testcase-main/
 antlr-4.13.2-complete.jar
+tools/
 # =========================
 # 1. 操作系统生成的隐藏文件
 # =========================
@@ -53,6 +54,7 @@ __pycache__/
 *.so
 .Python
 build/
+/generated-data/
 develop-eggs/
 dist/
 downloads/

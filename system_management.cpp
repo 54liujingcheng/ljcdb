@@ -15,7 +15,7 @@ int serialization(Row& src, char* dest, Schema& sc){
             }else if(desc.type == 1 && holds_alternative<double>(src[i])){
                 memcpy(dest+j,&(get<double>(src[i])),desc.len);
             }else if(desc.type == 2 && holds_alternative<string>(src[i])){
-                string tmp = get<string>(src[i]);
+                string& tmp = get<string>(src[i]);
                 if (tmp.size() > static_cast<size_t>(desc.len))
                     return -1;
                 size_t tmplen = tmp.size();
@@ -51,7 +51,7 @@ int deserialization(char* src, Row& dest, Schema& sc){
             }else if(desc.type == 2){
                 size_t len = strnlen(src + j, desc.len);
                 string tmp(src + j, len);
-                dest.push_back(tmp);
+                dest.push_back(move(tmp));
             }else if(desc.type == 3){
                 DATE tmp;
                 memcpy(&tmp, src+j, desc.len);
@@ -77,7 +77,7 @@ int index_serialization(Row& src, char* dest, Schema& sc, Index* idx){
             }else if(desc.type == 1 && holds_alternative<double>(src[i])){
                 memcpy(dest+j,&(get<double>(src[i])),desc.len);
             }else if(desc.type == 2 && holds_alternative<string>(src[i])){
-                string tmp = get<string>(src[i]);
+                string& tmp = get<string>(src[i]);
                 if (tmp.size() > static_cast<size_t>(desc.len))
                     return -1;
                 size_t tmplen = tmp.size();
@@ -113,7 +113,7 @@ int index_deserialization(char* src, Row& dest, Schema& sc, Index* idx){
             }else if(desc.type == 2){
                 size_t len = strnlen(src + j, desc.len);
                 string tmp(src + j, len);
-                dest.push_back(tmp);
+                dest.push_back(move(tmp));
             }else if(desc.type == 3){
                 DATE tmp;
                 memcpy(&tmp, src+j, desc.len);
@@ -124,7 +124,7 @@ int index_deserialization(char* src, Row& dest, Schema& sc, Index* idx){
     }
     return 0;
 }
-int LoadCSV(DbManager& dbm, string table_name, string load_path){
+int LoadCSV(DbManager& dbm, const string& table_name, const string& load_path){
     FILE* f = fopen(load_path.c_str(), "rb");
     int cnt=0;
     if(!f)return 0;
@@ -140,6 +140,7 @@ int LoadCSV(DbManager& dbm, string table_name, string load_path){
         int cursor = 0;
         for(int i=0;i<sc.col;i++){
             int old_cursor = (i == 0?0:cursor+1);
+            cursor = old_cursor;
             while(buf[cursor] != ',' && buf[cursor] != '\r' && buf[cursor] != '\n' && buf[cursor] != '\0'){
                     cursor++;
             }

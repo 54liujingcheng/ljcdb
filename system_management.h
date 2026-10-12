@@ -231,7 +231,7 @@ struct DbManager{
         else return -2;
     }
     int UseDb(string& name){
-        if(name == dbname)return 0;
+        if(name == dbname)return -2;
         fs::path db = name;
         db = fs::path("data") / db ;
         fs::path catalog = db, index = db, foreign = db;
@@ -314,8 +314,11 @@ struct DbManager{
         }
         return res;
     }
-    Table* CreateTable(char* name, Schema& sc){
-        if(dbname.empty() || name_table.count(name))return 0;
+    Table* CreateTable(char* name, Schema& sc, int& errcode){
+        errcode = OK;
+        if(name == nullptr || std::memchr(name, '\0', MAX_STR) == nullptr ||
+           name[0] == '\0' || dbname.empty() || name_table.count(name) ||
+           !IsValidSchema(sc)){errcode = ERR_ELSE;return 0;}
         Table* tb=nullptr;
         for(int i=0;i<MAX_TBL;i++){
             if(!tablebm.test(i)){
@@ -324,7 +327,7 @@ struct DbManager{
                 break;
             }
         }
-        if(tb == 0)return 0;
+        if(tb == 0){errcode = ERR_ELSE;return 0;}
         fs::path path = fs::path("data") / fs::path(dbname) / fs::path(string(name) + "_" + to_string(next_tableid) + ".ljcdb");
         int fid;
         FILE* f = fopen(path.c_str(),"w");
@@ -375,31 +378,35 @@ struct DbManager{
         tb->name_cid.clear();
         return OK;
     }
-    Index* CreateIndex(char* tablename, char* indexname, int col, vector<int>& cid, int unique, int implicit, int type){
-        if(!name_table.count(tablename) || col!=cid.size() || col<=0)return 0;
+    Index* CreateIndex(char* tablename, char* indexname, int col, vector<int>& cid, int unique, int implicit, int type, int& errcode){
+        errcode = OK;
+        if(!name_table.count(tablename) || col!=cid.size() || col<=0){errcode = ERR_ELSE;return 0;}
         Table* tb = name_table[tablename];
-        if(idname_idx.count({tb->id, indexname}))return 0;
         Index* ix = nullptr;
         if(type==0){
             unique = 1;
-            if(tb->pkid != -1)return 0;
+            if(tb->pkid != -1){
+                errcode = ERR_PRIMARY;
+                return 0;
+            }
         }
+        if(idname_idx.count({tb->id, indexname})){errcode = ERR_ELSE;return 0;}
         vector<Index*> normidx = id_normidx[tb->id];
         for(int i=0;i<normidx.size();i++){
-            if(strcmp(normidx[i]->name,indexname)==0)return 0;
-            if(normidx[i]->type == 1&&normidx[i]->implicit == 0&&normidx[i]->cid == cid)return 0;
+            if(normidx[i]->type == 1&&normidx[i]->implicit == 0&&normidx[i]->cid == cid){errcode = ERR_ELSE;return 0;}
         }
         for(int i=0;i<col;i++){
-            if(cid[i]>=tb->mng->tbmeta.schema.col || cid[i]<0)return 0;
+            if(cid[i]>=tb->mng->tbmeta.schema.col || cid[i]<0){errcode = ERR_ELSE;return 0;}
         }
         for(int i=0;i<MAX_IDX;i++){
             if(!idxbm.test(i)){
                 idxbm.set(i);
                 ix = &idx[i];
+                errcode = OK;
                 break;
             }
         }
-        if(!ix)return 0;
+        if(!ix){errcode = ERR_ELSE;return 0;}
         fs::path path = fs::path("data") / fs::path(dbname) / fs::path(string(tablename) + "_" + to_string(next_idxid) + ".index");
         int fid;
         FILE* f = fopen(path.c_str(),"w");
@@ -444,10 +451,12 @@ struct DbManager{
                 j+=len;
             }
             if(type==0&&KeyHasNull(buf+recsize,col)){
+                errcode = ERR_NULL;
                 flag=1;
                 break;
             }
             if(ix->mng->InsertEntry(buf+recsize,rid) != 0){
+                errcode = ERR_DUPULICATE;
                 flag = 1;
                 break;
             }
@@ -463,10 +472,10 @@ struct DbManager{
         Index* ix = idname_idx[{tb->id, indexname}];
         for(int i=0;i<MAX_FK;i++){
             if(fkbm.test(i) && (fk[i].pa_idx_id == ix->id || fk[i].ch_idx_id == ix->id))
-                return ;
+                return ERR_FORIEGN;
         }
         fs::path path = ix->file_name;
-        if(!fs::exists(path))return ;
+        if(!fs::exists(path))return ERR_ELSE;
         idname_idx.erase({tb->id,indexname});
         id_idx.erase(ix->id);
         if(ix->type == 1){
@@ -489,27 +498,28 @@ struct DbManager{
         idxbm.reset(ix-idx);
         return OK;
     }
-    Foreign* CreateForeign(char* _name, int pa_tableid, int ch_tableid, vector<int>& ccid){
+    Foreign* CreateForeign(char* _name, int pa_tableid, int ch_tableid, vector<int>& ccid, int& errcode){
+        errcode = OK;
         string __name;
-        if(!id_table.count(pa_tableid) || !id_table.count(ch_tableid))return 0;
+        if(!id_table.count(pa_tableid) || !id_table.count(ch_tableid)){errcode = ERR_ELSE;return 0;}
         if(_name && id_outfk.count(ch_tableid))
             for(auto i:id_outfk[ch_tableid]){
-                if(strcmp(_name, i->name)==0)return 0;
+                if(strcmp(_name, i->name)==0){errcode = ERR_ELSE;return 0;}
             }
         Table* ptb = id_table[pa_tableid], *ctb = id_table[ch_tableid];
         Index* pix,*cix;
         Foreign* fkey = nullptr;
         char* pa_name = ptb->name, *ch_name = ctb->name;
-        if(ptb->pkid == -1)return nullptr;
+        if(ptb->pkid == -1){errcode = ERR_FORIEGN;return nullptr;}
         pix = id_idx[ptb->pkid];
-        if(ccid.size()!=pix->col)return nullptr;
+        if(ccid.size()!=pix->col){errcode = ERR_FORIEGN;return nullptr;}
         Schema& csc = ctb->mng->tbmeta.schema;
         Schema& psc = ptb->mng->tbmeta.schema;
         for(int i=0;i<pix->col;i++){
-            if(ccid[i]<0 || ccid[i] >= csc.col)return 0;
+            if(ccid[i]<0 || ccid[i] >= csc.col){errcode = ERR_ELSE;return 0;}
             Col& l = psc.desc[pix->cid[i]];
             Col& r = csc.desc[ccid[i]];
-            if(l.type != r.type || l.len != r.len)return nullptr;
+            if(l.type != r.type || l.len != r.len){errcode = ERR_FORIEGN;return 0;}
         }
         int childsize = csc.recordsize;
         for(ull rid = ctb->mng->FirstRecord();rid != 0;rid = ctb->mng->NextRecord(rid)){
@@ -524,6 +534,7 @@ struct DbManager{
             }
             if(!KeyHasNull(buf+childsize,ccid.size())){
                 if(pix->mng->Exist(buf+childsize)==0){
+                    errcode = ERR_FORIEGN;
                     return nullptr;
                 }
             }
@@ -536,7 +547,7 @@ struct DbManager{
                 break;
             }
         }
-        if(!fkey)return 0;
+        if(!fkey){errcode = ERR_ELSE;return 0;}
         int flag=0;
         for(int i=0;i<MAX_IDX;i++){
             if(idxbm.test(i)&&idx[i].table_id == ch_tableid&&idx[i].cid == ccid){
@@ -549,8 +560,12 @@ struct DbManager{
         if(!_name)strcpy(fkey->name,__name.c_str());
         else strcpy(fkey->name,_name);
         if(!flag){
-            cix = CreateIndex(id_table[ch_tableid]->name, fkey->name, ccid.size(), ccid, 0, 1, 1);
-            if(cix == nullptr)return 0;
+            int tmppp;
+            cix = CreateIndex(id_table[ch_tableid]->name, fkey->name, ccid.size(), ccid, 0, 1, 1, tmppp);
+            if(cix == nullptr){
+                errcode = tmppp;
+                return 0;
+            }
         }
         fkbm.set(iii);
         fkey->id = next_fkid++;
@@ -598,7 +613,7 @@ struct DbManager{
         }
         return OK;
     }
-    Row ReadRow(string table_name, ull rid){
+    Row ReadRow(string& table_name, ull rid){
         Row row;
         if(!name_table.count(table_name))return row;
         Table* tb = name_table[table_name];
@@ -639,8 +654,8 @@ struct DbManager{
             primary = id_idx[tb->pkid];
             IntoIndexKey(buf,buf+recsize,sc,primary->cid);
             indexes.push_back(primary);
-            if(KeyHasNull(buf+recsize, primary->col))return ERR_PRIMARY;
-            if(primary->mng->Exist(buf+recsize))return ERR_PRIMARY;
+            if(KeyHasNull(buf+recsize, primary->col))return ERR_NULL;
+            if(primary->mng->Exist(buf+recsize))return ERR_DUPULICATE;
         }
         vector<Index*>& norm = id_normidx[tb->id];
         for(int i=0;i<norm.size();i++){
@@ -754,7 +769,7 @@ struct DbManager{
         for(Index* index:indexes){
             IntoIndexKey(oldRecord,oldKey,sc,index->cid);
             IntoIndexKey(newRecord,newKey,sc,index->cid);
-            if(index->type==0 && KeyHasNull(newKey,index->col))return ERR_PRIMARY;
+            if(index->type==0 && KeyHasNull(newKey,index->col))return ERR_NULL;
             if(index->mng->cmp(oldKey,newKey,0,0)==0)continue;
             if(index->type==0 && index->mng->Exist(newKey))return ERR_DUPULICATE;
             if(index->type!=0 && index->uni &&
@@ -865,7 +880,7 @@ struct DbManager{
         return rid;
     }
 };
-int LoadCSV(DbManager& dbm, string table_name, string load_path);
+int LoadCSV(DbManager& dbm, const string& table_name, const string& load_path);
 /*
 文件格式：
 /data/dbname

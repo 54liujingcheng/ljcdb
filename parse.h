@@ -1,5 +1,7 @@
 #include "parser/generated/SQLBaseVisitor.h"
 #include "query.h"
+#include <limits>
+#include <stdexcept>
 #pragma once
 enum class Simple {
     CREATE_DATABASE,
@@ -45,6 +47,31 @@ struct CreateTableRequest{
 typedef variant<UnboundDeleteRequest, UnboundInsertRequest, UnboundUpdateRequest, UnboundSelectRequest,
 SimpleRequest, AlterRequest, LoadRequest, CreateTableRequest> UnboundRequest;
 class SQLJCVisitor : public SQLBaseVisitor {
+    static long long parseInteger(std::string_view text, const char* what) {
+        long long value = 0;
+        auto [end, ec] = std::from_chars(text.data(), text.data() + text.size(), value);
+        if(ec != std::errc{} || end != text.data() + text.size())
+            throw std::runtime_error(std::string("invalid ") + what);
+        return value;
+    }
+    static double parseDouble(std::string_view text) {
+        double value = 0;
+        auto [end, ec] = std::from_chars(text.data(), text.data() + text.size(), value);
+        if(ec != std::errc{} || end != text.data() + text.size())
+            throw std::runtime_error("invalid floating-point literal");
+        return value;
+    }
+    static bool containsErrorNode(antlr4::tree::ParseTree* node) {
+        if(dynamic_cast<antlr4::tree::ErrorNode*>(node) != nullptr)
+            return true;
+        if(auto* context = dynamic_cast<antlr4::ParserRuleContext*>(node);
+           context != nullptr && context->exception)
+            return true;
+        for(auto* child : node->children){
+            if(containsErrorNode(child))return true;
+        }
+        return false;
+    }
 public:
     AggregateFunc parseAggregator(SQLParser::AggregatorContext *ctx) {
         if(ctx->Count())return AggregateFunc::COUNT;
@@ -52,6 +79,7 @@ public:
         else if(ctx->Max())return AggregateFunc::MAX;
         else if(ctx->Min())return AggregateFunc::MIN;
         else if(ctx->Sum())return AggregateFunc::SUM;
+        throw std::runtime_error("invalid aggregate function");
     }
     CompareOp parseOperator_(SQLParser::Operator_Context *ctx) {
         if(ctx->EqualOrAssign())return CompareOp::EQ;
@@ -60,10 +88,12 @@ public:
         else if(ctx->Less())return CompareOp::LT;
         else if(ctx->LessEqual())return CompareOp::LE;
         else if(ctx->NotEqual())return CompareOp::NE;
+        throw std::runtime_error("invalid comparison operator");
     }
     pair<string, string> parseColumn(SQLParser::ColumnContext *ctx){
         if(ctx->Identifier().size()==1)return {"",ctx->Identifier(0)->getText()};
-        else return {ctx->Identifier(0)->getText(), ctx->Identifier(1)->getText()};
+        if(ctx->Identifier().size()==2)return {ctx->Identifier(0)->getText(), ctx->Identifier(1)->getText()};
+        throw std::runtime_error("invalid column reference");
     }
     vector<pair<string, string>> parseColumn_list(SQLParser::Column_listContext *ctx){
         vector<pair<string, string>> vec;
@@ -82,9 +112,7 @@ public:
     Value parseValue(SQLParser::ValueContext *ctx){
         if(ctx->Float()){
             string s = ctx->Float()->getText();
-            double val;
-            from_chars(s.c_str(), s.c_str()+s.size(), val);
-            return val;
+            return parseDouble(s);
         }
         else if(ctx->String()){
             string s = ctx->String()->getText();
@@ -94,31 +122,36 @@ public:
             return (bool)(false);
         }
         else if(ctx->signed_integer()){
-            string s = ctx->signed_integer()->UnsignedInteger()->getText();
-            int val;
-            from_chars(s.c_str(), s.c_str()+s.size(), val);
-            if(ctx->signed_integer()->Minus())val = -val;
-            return val;
+            string s = ctx->signed_integer()->getText();
+            long long value = parseInteger(s, "integer literal");
+            if(value < std::numeric_limits<int>::min() ||
+               value > std::numeric_limits<int>::max())
+                throw std::runtime_error("integer literal out of range");
+            return static_cast<int>(value);
         }
+        throw std::runtime_error("invalid value");
     }
     OrderBy parseOrder(SQLParser::OrderContext *ctx){
         if (ctx->getText() == "ASC")
             return OrderBy::ASC;
         else if (ctx->getText() == "DESC")
             return OrderBy::DESC;
+        throw std::runtime_error("invalid order direction");
     }
     pair<int, int> parseType_(SQLParser::Type_Context *ctx){
         if(ctx->getText() == "INT")return {0,sizeof(int)};
         if(ctx->getText() == "FLOAT" || ctx->getText() == "DOUBLE")return {1,sizeof(double)};
         if(ctx->getText().starts_with("VARCHAR") || ctx->getText().starts_with("CHAR")){
             string s = ctx->UnsignedInteger()->getText();
-            int val;
-            from_chars(s.c_str(), s.c_str()+s.size(), val);
-            return {2,val};
+            long long value = parseInteger(s, "string length");
+            if(value <= 0 || value > 2048)
+                throw std::runtime_error("string length out of range");
+            return {2,static_cast<int>(value)};
         }
         if(ctx->getText() == "DATE"){
             return {3,sizeof(DATE)};
         }
+        throw std::runtime_error("invalid column type");
     }
     vector<Value> parseValue_list(SQLParser::Value_listContext *ctx){
         vector<Value> vec;
@@ -139,12 +172,14 @@ public:
         if(ctx->value()){
             res.is_val = 1;
             res.val = parseValue(ctx->value());
+            return res;
         }
         if(ctx->column()){
             res.is_val = 0;
             res.col_name = parseColumn(ctx->column());
+            return res;
         }
-        return res;
+        throw std::runtime_error("invalid expression");
     }
     pair<pair<string, string>, AggregateFunc>parseSelector(SQLParser::SelectorContext *ctx){
         pair<string, string> col;
@@ -162,6 +197,7 @@ public:
         if(ctx->Count()){
             return {{"",""},AggregateFunc::COUNT};
         }
+        throw std::runtime_error("invalid selector");
     }
     vector<pair<pair<string, string>, AggregateFunc>> parseSelectors(SQLParser::SelectorsContext *ctx){
         vector<pair<pair<string, string>, AggregateFunc>> vec;
@@ -196,21 +232,23 @@ public:
         return vec;
     }
     pair<int, int> parseLimit_part(SQLParser::Limit_partContext *ctx){
-        string s;
-        int val;
+        auto parseLimit = [](long long value) {
+            if(value < 0 || value > std::numeric_limits<int>::max())
+                throw std::runtime_error("LIMIT/OFFSET out of range");
+            return static_cast<int>(value);
+        };
         if(ctx->UnsignedInteger().size()==1){
-            s = ctx->UnsignedInteger(0)->getText();
-            from_chars(s.c_str(), s.c_str() + s.size(), val);
-            return {val,0};
+            int value = parseLimit(parseInteger(ctx->UnsignedInteger(0)->getText(), "LIMIT"));
+            return {value,0};
         }
-        else{
-            s = ctx->UnsignedInteger(0)->getText();
-            from_chars(s.c_str(), s.c_str() + s.size(), val);
-            int val2;
-            s = ctx->UnsignedInteger(1)->getText();
-            from_chars(s.c_str(), s.c_str() + s.size(), val2);
-            return {val,val2};
+        if(ctx->UnsignedInteger().size()==2){
+            int value = parseLimit(parseInteger(ctx->UnsignedInteger(0)->getText(), "LIMIT"));
+            int offset = parseLimit(parseInteger(ctx->UnsignedInteger(1)->getText(), "OFFSET"));
+            if(static_cast<long long>(value) + offset > std::numeric_limits<int>::max())
+                throw std::runtime_error("LIMIT plus OFFSET is out of range");
+            return {value,offset};
         }
+        throw std::runtime_error("invalid LIMIT clause");
     }
     virtual std::any visitWhere_operator_expression(SQLParser::Where_operator_expressionContext *ctx) override {
         UnboundCondition ubc;
@@ -288,8 +326,9 @@ public:
         if(ctx->group_by_part())usr.GROUPBY = parseGroup_by_part(ctx->group_by_part());
         if(ctx->order_by_part())usr.ORDERBY = parseOrder_by_part(ctx->order_by_part());
         if(ctx->limit_part()){
-            usr.LIMIT = parseLimit_part(ctx->limit_part()).first;
-            usr.OFFSET = parseLimit_part(ctx->limit_part()).second;
+            auto limit = parseLimit_part(ctx->limit_part());
+            usr.LIMIT = limit.first;
+            usr.OFFSET = limit.second;
         }
         else usr.LIMIT = -1, usr.OFFSET = 0;
         return usr;
@@ -347,42 +386,80 @@ public:
         int def_offset = 0;
         int offset;
         ctr.table_name = ctx->Identifier()->getText();
+        if(ctr.table_name.empty() || ctr.table_name.size() >= MAX_STR)
+            throw std::runtime_error("table name is too long");
         for(auto i:ctx->field_list()->field()){
-            if(auto* normal = dynamic_cast<SQLParser::Normal_fieldContext*>(i)){
+            if(dynamic_cast<SQLParser::Normal_fieldContext*>(i) != nullptr){
                 col++;
             }
         }
+        if(col <= 0 || col > 32)
+            throw std::runtime_error("invalid number of columns");
         sc.col = col;
         sc.nullen = (col+7)/8;
         offset = sc.nullen;
         col = 0;
         for(auto i:ctx->field_list()->field()){
             if(auto* normal = dynamic_cast<SQLParser::Normal_fieldContext*>(i)){
-                strcpy(sc.desc[col].name,normal->Identifier()->getText().c_str());
-                sc.desc[col].type = parseType_(normal->type_()).first;
-                sc.desc[col].len = parseType_(normal->type_()).second;
-                if(normal->Null())sc.desc[col].nullable = 0;
-                else sc.desc[col].nullable = 1;
+                string column_name = normal->Identifier()->getText();
+                if(column_name.empty() || column_name.size() >= MAX_STR)
+                    throw std::runtime_error("column name is too long");
+                std::memcpy(sc.desc[col].name, column_name.c_str(), column_name.size() + 1);
+                auto type = parseType_(normal->type_());
+                sc.desc[col].type = type.first;
+                sc.desc[col].len = type.second;
+                bool not_null = false;
+                for(auto* child : normal->children){
+                    if(child->getText() == "NOT"){
+                        not_null = true;
+                        break;
+                    }
+                }
+                sc.desc[col].nullable = !not_null;
                 if(normal->value()){
                     sc.desc[col].defalutable = 1;
                     sc.desc[col].default_offset = def_offset;
                     Value def = parseValue(normal->value());
-                    if(holds_alternative<bool>(def))sc.desc[col].default_offset = -1;
+                    if(holds_alternative<bool>(def)){
+                        if(!sc.desc[col].nullable)
+                            throw std::runtime_error("NULL default on NOT NULL column");
+                        sc.desc[col].default_offset = -1;
+                    }
                     else if(sc.desc[col].type==0){
-                        memcpy(sc.defval+def_offset, get_if<int>(&def), sc.desc[col].len);
+                        int* value = get_if<int>(&def);
+                        if(value == nullptr)throw std::runtime_error("default value type mismatch");
+                        if(def_offset > static_cast<int>(sizeof(sc.defval)) - sc.desc[col].len)
+                            throw std::runtime_error("default values are too large");
+                        memcpy(sc.defval+def_offset, value, sc.desc[col].len);
                         def_offset += sc.desc[col].len;
                     }
                     else if(sc.desc[col].type==1){
-                        memcpy(sc.defval+def_offset, get_if<double>(&def), sc.desc[col].len);
+                        double* value = get_if<double>(&def);
+                        if(value == nullptr)throw std::runtime_error("default value type mismatch");
+                        if(def_offset > static_cast<int>(sizeof(sc.defval)) - sc.desc[col].len)
+                            throw std::runtime_error("default values are too large");
+                        memcpy(sc.defval+def_offset, value, sc.desc[col].len);
                         def_offset += sc.desc[col].len;
                     }
                     else if(sc.desc[col].type==2){
-                        memcpy(sc.defval+def_offset, get<string>(def).data(), sc.desc[col].len);
+                        string* value = get_if<string>(&def);
+                        if(value == nullptr || value->size() > static_cast<size_t>(sc.desc[col].len))
+                            throw std::runtime_error("default string is too long or has wrong type");
+                        if(def_offset > static_cast<int>(sizeof(sc.defval)) - sc.desc[col].len)
+                            throw std::runtime_error("default values are too large");
+                        memset(sc.defval+def_offset, 0, sc.desc[col].len);
+                        memcpy(sc.defval+def_offset, value->data(), value->size());
                         def_offset += sc.desc[col].len;
                     }
                     else if(sc.desc[col].type==3){
-                        DATE val = {parse_date_yyyy_mm_dd(get<string>(def)).value()};
-                        memcpy(sc.defval+def_offset, &val.date, sc.desc[col].len);
+                        string* value = get_if<string>(&def);
+                        if(value == nullptr || !is_valid_date_string(*value))
+                            throw std::runtime_error("invalid DATE default");
+                        auto date = parse_date_yyyy_mm_dd(*value);
+                        if(!date)throw std::runtime_error("invalid DATE default");
+                        if(def_offset > static_cast<int>(sizeof(sc.defval)) - sc.desc[col].len)
+                            throw std::runtime_error("default values are too large");
+                        memcpy(sc.defval+def_offset, &date->date, sc.desc[col].len);
                         def_offset += sc.desc[col].len;
                     }
                 }
@@ -427,6 +504,8 @@ public:
         sc.recordsize = offset;
         sc.col = col;
         sc.nullen = (col+7)/8;
+        if(!IsValidSchema(sc))
+            throw std::runtime_error("invalid table schema");
         ctr.schema = move(sc);
         return UnboundRequest{move(ctr)};
     }
@@ -515,8 +594,11 @@ public:
         if (ctx->Null()) {
             return UnboundRequest{SimpleRequest{Simple::EMPTY, nullopt}};
         }
+        throw std::runtime_error("invalid statement");
     }
     std::any visitProgram(SQLParser::ProgramContext* ctx) override{
+        if(containsErrorNode(ctx))
+            throw std::runtime_error("SQL syntax error");
         vector<UnboundRequest> requests;
         requests.reserve(ctx->statement().size());
         for (auto* statement : ctx->statement()) {

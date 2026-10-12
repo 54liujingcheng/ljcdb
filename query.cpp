@@ -61,6 +61,20 @@ BoundInsertRequest BindingInsertRequest(DbManager& dbm,UnboundInsertRequest& req
     }
     return BoundInsertRequest{table_id, req.rows, 0};
 }
+static optional<int> BoundSelectOutputType(const BoundSelectRequest& request){
+    if(request.errorcode != OK || request.col_items.size() != 1)
+        return nullopt;
+    const auto& [column, aggregate] = request.col_items.front();
+    if(aggregate == AggregateFunc::COUNT)
+        return 0;
+    if(aggregate == AggregateFunc::AVG)
+        return 1;
+    if(!column)
+        return nullopt;
+    if(aggregate == AggregateFunc::SUM)
+        return column->type == 0 ? 4 : (column->type == 1 ? 1 : -1);
+    return column->type;
+}
 pair<Condition, int> ConditionBindingHelper(Table* ltb,Table* rtb, UnboundCondition& i, DbManager& dbm){
     Schema& lsc = ltb->mng->tbmeta.schema;
     Schema& rsc = rtb->mng->tbmeta.schema;
@@ -130,7 +144,7 @@ pair<Condition, int> ConditionBindingHelper(Table* ltb,Table* rtb, UnboundCondit
             }
         }
         else{
-            for(auto i:tmp.values){
+            for(auto& i:tmp.values){
                 if(holds_alternative<int>(i) && tmp.left.col.type != 0 || holds_alternative<double>(i) && tmp.left.col.type != 1 || holds_alternative<string>(i) && tmp.left.col.type != 2 )
                     return {tmp, ERR_ELSE};
             }
@@ -145,12 +159,15 @@ pair<Condition, int> ConditionBindingHelper(Table* ltb,Table* rtb, UnboundCondit
         if(tmp.type == ConditionType::LIKE && tmp.left.col.type != 2)return {tmp, ERR_ELSE};
     }
     if(tmp.type == ConditionType::SUB_COMPARE || tmp.type == ConditionType::SUB_IN){
-        if(i.left.is_val)return {tmp, ERR_ELSE};
+        if(i.left.is_val || !i.sub)return {tmp, ERR_ELSE};
         if(!ltb->name_cid.count(i.left.col_name.second))return {tmp, ERR_ELSE};
         int cid = ltb->name_cid[i.left.col_name.second];
         BoundColumn ttmp = {ltable_id, cid, lsc.desc[cid].type, lsc.desc[cid].nullable};
         tmp.left = {i.left.is_val, ttmp, i.left.val};
-        tmp.sub = make_shared<BoundSelectRequest>(BindingSelectRequest(dbm, *i.sub));
+        BoundSelectRequest sub = BindingSelectRequest(dbm, *i.sub);
+        optional<int> output_type = BoundSelectOutputType(sub);
+        if(!output_type || *output_type != tmp.left.col.type)return {tmp, ERR_ELSE};
+        tmp.sub = make_shared<BoundSelectRequest>(move(sub));
     }
     return {tmp,0};
 }
@@ -179,7 +196,7 @@ BoundUpdateRequest BindingUpdateRequest(DbManager& dbm,UnboundUpdateRequest& req
     Schema& sc = tb->mng->tbmeta.schema;
     int table_id = tb->id;
     if(req.values.size() != req.col_names.size())return BoundUpdateRequest{0, col, req.values, conditions, ERR_ELSE};
-    for(auto i:req.col_names){
+    for(auto& i:req.col_names){
         if((!i.first.empty() && i.first!=req.FROM) || tb->name_cid.count(i.second)==0){
             return BoundUpdateRequest{0, col, req.values, conditions, ERR_ELSE};
         }
@@ -191,13 +208,13 @@ BoundUpdateRequest BindingUpdateRequest(DbManager& dbm,UnboundUpdateRequest& req
     for(int i=0;i<req.values.size();i++){
         if(holds_alternative<bool>(req.values[i])){
             if(col[i].nullable)continue;
-            else return BoundUpdateRequest{tb->id, col, req.values, conditions, ERR_ELSE};
+            else return BoundUpdateRequest{tb->id, col, req.values, conditions, ERR_NULL};
         }
         if(col[i].type == 3 ){
             if(holds_alternative<string>(req.values[i]) && is_valid_date_string(get<string>(req.values[i]))){
                 req.values[i] = parse_date_yyyy_mm_dd(get<string>(req.values[i])).value();
             }
-            else return BoundUpdateRequest{tb->id, col, req.values, conditions, ERR_ELSE};
+            else return BoundUpdateRequest{tb->id, col, req.values, conditions, ERR_DATE};
         }
         if(holds_alternative<int>(req.values[i]) && col[i].type!=0 || holds_alternative<double>(req.values[i]) && col[i].type!=1 || holds_alternative<string>(req.values[i]) && col[i].type!=2)return BoundUpdateRequest{tb->id, col, req.values, conditions, ERR_ELSE};
     }
@@ -220,8 +237,12 @@ BoundSelectRequest BindingSelectRequest(DbManager& dbm,UnboundSelectRequest& req
     vector<Condition> conditions;
     bool star = 0;
     bool withagg = false;
-    for(auto i:req.FROM){
-        if(dbm.name_table.count(i)==0)return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
+    if(req.FROM.empty() || req.col_items.empty())
+        return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
+    unordered_set<string> bound_tables;
+    for(auto& i:req.FROM){
+        if(!bound_tables.insert(i).second || dbm.name_table.count(i)==0)
+            return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
         table_ids.push_back(dbm.name_table[i]->id);
     }
     if(req.col_items[0].first.first.empty() && req.col_items[0].first.second == "*"){
@@ -235,8 +256,8 @@ BoundSelectRequest BindingSelectRequest(DbManager& dbm,UnboundSelectRequest& req
         }
     }
     else
-    for(auto i:req.col_items){
-        string table_name = i.first.first, col_name = i.first.second;
+    for(auto& i:req.col_items){
+        string& table_name = i.first.first, &col_name = i.first.second;
         AggregateFunc agg = i.second;
         if(agg!=AggregateFunc::NONE)withagg = true;
         if(table_name.empty()&&col_name.empty()){
@@ -274,8 +295,8 @@ BoundSelectRequest BindingSelectRequest(DbManager& dbm,UnboundSelectRequest& req
         else return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
         if((agg == AggregateFunc::AVG || agg == AggregateFunc::SUM) && col_items.back().first->type != 0 && col_items.back().first->type != 1)return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
     }
-    for(auto i:req.ORDERBY){
-        string table_name = i.first.first, col_name = i.first.second;
+    for(auto& i:req.ORDERBY){
+        string& table_name = i.first.first, &col_name = i.first.second;
         OrderBy od = i.second;
         if(table_name.empty()&&col_name.empty()){
             return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
@@ -310,8 +331,8 @@ BoundSelectRequest BindingSelectRequest(DbManager& dbm,UnboundSelectRequest& req
         }
         else return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
     }
-    for(auto i:req.GROUPBY){
-        string table_name = i.first, col_name = i.second;
+    for(auto& i:req.GROUPBY){
+        string &table_name = i.first, &col_name = i.second;
         if(table_name.empty()&&col_name.empty()){
             return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
         }
@@ -345,24 +366,11 @@ BoundSelectRequest BindingSelectRequest(DbManager& dbm,UnboundSelectRequest& req
         }
         else return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
     }
-    /*if(withagg || !req.GROUPBY.empty())
-    for(int i=0;i<col_items.size();i++){
-        if(col_items[i].first&&col_items[i].second == AggregateFunc::NONE){
-            int flag=0;
-            for(int j=0;j<GROUPBY.size();j++){
-                if(GROUPBY[j].cid == col_items[i].first.value().cid && GROUPBY[j].table_id == col_items[i].first->table_id){
-                    flag = 1;
-                    break;
-                }
-            }
-            if(!flag)return {table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
-        }
-    }*/
     for(auto& i:req.conditions){
         if(i.type == ConditionType::COMPARE){
             if(!i.left.is_val&&!i.right.is_val){
-                string l_tname = i.left.col_name.first, l_cname = i.left.col_name.second;
-                string r_tname = i.right.col_name.first, r_cname = i.right.col_name.second;
+                string &l_tname = i.left.col_name.first, &l_cname = i.left.col_name.second;
+                string &r_tname = i.right.col_name.first, &r_cname = i.right.col_name.second;
                 Table* l, *r;
                 int lcid, rcid;
                 if(l_tname.empty()){
@@ -409,7 +417,7 @@ BoundSelectRequest BindingSelectRequest(DbManager& dbm,UnboundSelectRequest& req
                 else return BoundSelectRequest{table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, tmp.second, star};
             }
             else if(!i.left.is_val){
-                string l_tname = i.left.col_name.first, l_cname = i.left.col_name.second;
+                string &l_tname = i.left.col_name.first, &l_cname = i.left.col_name.second;
                 Table* l;
                 int lcid;
                 if(l_tname.empty()){
@@ -438,7 +446,7 @@ BoundSelectRequest BindingSelectRequest(DbManager& dbm,UnboundSelectRequest& req
                 else return BoundSelectRequest{table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, tmp.second, star};
             }
             else if(i.left.is_val&&!i.right.is_val){
-                string r_tname = i.right.col_name.first, r_cname = i.right.col_name.second;
+                string &r_tname = i.right.col_name.first, &r_cname = i.right.col_name.second;
                 Table* r;
                 int rcid;
                 if(r_tname.empty()){
@@ -470,7 +478,7 @@ BoundSelectRequest BindingSelectRequest(DbManager& dbm,UnboundSelectRequest& req
         }
         else{
             if(!i.left.is_val){
-                string l_tname = i.left.col_name.first, l_cname = i.left.col_name.second;
+                string &l_tname = i.left.col_name.first, &l_cname = i.left.col_name.second;
                 Table* l;
                 int lcid;
                 if(l_tname.empty()){
@@ -499,6 +507,49 @@ BoundSelectRequest BindingSelectRequest(DbManager& dbm,UnboundSelectRequest& req
                 else return BoundSelectRequest{table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, tmp.second, star};
             }
             else return BoundSelectRequest{table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, ERR_ELSE, star};
+        }
+    }
+    if(withagg || !GROUPBY.empty()){
+        unordered_set<BoundColumn> determined(GROUPBY.begin(), GROUPBY.end());
+        bool changed = true;
+        while(changed){
+            changed = false;
+            for(const Condition& condition : conditions){
+                if(condition.type != ConditionType::COMPARE || condition.op != CompareOp::EQ ||
+                   condition.left.is_val || condition.right.is_val)
+                    continue;
+                if(determined.count(condition.left.col) && determined.insert(condition.right.col).second)
+                    changed = true;
+                if(determined.count(condition.right.col) && determined.insert(condition.left.col).second)
+                    changed = true;
+            }
+            for(int table_id : table_ids){
+                auto table_it = dbm.id_table.find(table_id);
+                if(table_it == dbm.id_table.end() || table_it->second->pkid == -1)
+                    continue;
+                auto index_it = dbm.id_idx.find(table_it->second->pkid);
+                if(index_it == dbm.id_idx.end())continue;
+                bool primary_key_determined = true;
+                for(int cid : index_it->second->cid){
+                    if(!determined.count(BoundColumn{table_id, cid})){
+                        primary_key_determined = false;
+                        break;
+                    }
+                }
+                if(!primary_key_determined)continue;
+                Schema& schema = table_it->second->mng->tbmeta.schema;
+                for(int cid = 0; cid < schema.col; ++cid){
+                    if(determined.insert(BoundColumn{table_id, cid,
+                       schema.desc[cid].type, schema.desc[cid].nullable}).second)
+                        changed = true;
+                }
+            }
+        }
+        for(const auto& item : col_items){
+            if(item.second == AggregateFunc::NONE &&
+               (!item.first || !determined.count(*item.first)))
+                return {table_ids, col_items, ORDERBY, GROUPBY, conditions,
+                        req.LIMIT, req.OFFSET, ERR_ELSE, star};
         }
     }
     return BoundSelectRequest{table_ids, col_items, ORDERBY, GROUPBY, conditions, req.LIMIT, req.OFFSET, 0, star};
@@ -575,11 +626,22 @@ unique_ptr<Operator> Planner(DbManager* dbm, BoundSelectRequest& bsr){//记得�
     }
     for(auto& i:bsr.conditions){
         if(i.type == ConditionType::SUB_COMPARE){
+            if(!i.sub)return nullptr;
             unique_ptr<Operator> root = Planner(dbm, *(i.sub));
             Tuple input;
             if(root == nullptr || root->Open())return nullptr;
             int res = root->Next(input);
             if(res == -1 || res == 1){
+                root->Close();
+                return nullptr;
+            }
+            if(input.values.size() != 1){
+                root->Close();
+                return nullptr;
+            }
+            Tuple extra;
+            res = root->Next(extra);
+            if(res != 1){
                 root->Close();
                 return nullptr;
             }
@@ -589,9 +651,11 @@ unique_ptr<Operator> Planner(DbManager* dbm, BoundSelectRequest& bsr){//记得�
             root->Close();
         }
         else if(i.type == ConditionType::SUB_IN){
+            if(!i.sub)return nullptr;
             unique_ptr<Operator> root = Planner(dbm, *(i.sub));
             Tuple input;
             if(root == nullptr || root->Open())return nullptr;
+            i.values.clear();
             while(1){
                 int res = root->Next(input);
                 if(res == -1){
@@ -601,6 +665,10 @@ unique_ptr<Operator> Planner(DbManager* dbm, BoundSelectRequest& bsr){//记得�
                 if(res == 1){
                     root->Close();
                     break;
+                }
+                if(input.values.size() != 1){
+                    root->Close();
+                    return nullptr;
                 }
                 i.values.push_back(input.values[0]);
             }
@@ -945,7 +1013,7 @@ int tuple_deserialization(vector<char>& src, Row& dest, vector<SlotType>& slots,
             }else if(desc.type == 3){
                 DATE tmp;
                 memcpy(&tmp, row+j, desc.len);
-                dest.push_back(tmp);
+                dest.push_back(move(tmp));
             }
             else if(desc.type == 4){
                 long long tmp;
@@ -973,7 +1041,7 @@ int tuple_serialization(Row& src, vector<char>& dest, vector<SlotType>& slots, i
             }else if(desc.type == 1 && holds_alternative<double>(src[i])){
                 memcpy(row+j,&(get<double>(src[i])),desc.len);
             }else if(desc.type == 2 && holds_alternative<string>(src[i])){
-                string tmp = get<string>(src[i]);
+                string& tmp = get<string>(src[i]);
                 if (tmp.size() > static_cast<size_t>(desc.len))
                     return -1;
                 size_t tmplen = tmp.size();
@@ -1013,11 +1081,22 @@ pair<int,int> DeleteExecuter(DbManager& dbm, BoundDeleteRequest& bdr){
     unique_ptr<Operator> root = nullptr;
     for(auto& i:bdr.conditions){
         if(i.type == ConditionType::SUB_COMPARE){
+            if(!i.sub)return {0,ERR_ELSE};
             unique_ptr<Operator> root = Planner(&dbm, *(i.sub));
             Tuple input;
             if(root == nullptr || root->Open())return {0,ERR_ELSE};
             int res = root->Next(input);
             if(res == -1 || res == 1){
+                root->Close();
+                return {0,ERR_ELSE};
+            }
+            if(input.values.size() != 1){
+                root->Close();
+                return {0,ERR_ELSE};
+            }
+            Tuple extra;
+            res = root->Next(extra);
+            if(res != 1){
                 root->Close();
                 return {0,ERR_ELSE};
             }
@@ -1027,9 +1106,11 @@ pair<int,int> DeleteExecuter(DbManager& dbm, BoundDeleteRequest& bdr){
             root->Close();
         }
         else if(i.type == ConditionType::SUB_IN){
+            if(!i.sub)return {0,ERR_ELSE};
             unique_ptr<Operator> root = Planner(&dbm, *(i.sub));
             Tuple input;
             if(root == nullptr || root->Open())return {0,ERR_ELSE};
+            i.values.clear();
             while(1){
                 int res = root->Next(input);
                 if(res == -1){
@@ -1039,6 +1120,10 @@ pair<int,int> DeleteExecuter(DbManager& dbm, BoundDeleteRequest& bdr){
                 if(res == 1){
                     root->Close();
                     break;
+                }
+                if(input.values.size() != 1){
+                    root->Close();
+                    return {0,ERR_ELSE};
                 }
                 i.values.push_back(input.values[0]);
             }
@@ -1080,11 +1165,22 @@ pair<int,int> UpdateExecuter(DbManager& dbm, BoundUpdateRequest& bur){
     unique_ptr<Operator> root = nullptr;
     for(auto& i:bur.conditions){
         if(i.type == ConditionType::SUB_COMPARE){
+            if(!i.sub)return {0,ERR_ELSE};
             unique_ptr<Operator> root = Planner(&dbm, *(i.sub));
             Tuple input;
             if(root == nullptr || root->Open())return {0,ERR_ELSE};
             int res = root->Next(input);
             if(res == -1 || res == 1){
+                root->Close();
+                return {0,ERR_ELSE};
+            }
+            if(input.values.size() != 1){
+                root->Close();
+                return {0,ERR_ELSE};
+            }
+            Tuple extra;
+            res = root->Next(extra);
+            if(res != 1){
                 root->Close();
                 return {0,ERR_ELSE};
             }
@@ -1094,9 +1190,11 @@ pair<int,int> UpdateExecuter(DbManager& dbm, BoundUpdateRequest& bur){
             root->Close();
         }
         else if(i.type == ConditionType::SUB_IN){
+            if(!i.sub)return {0,ERR_ELSE};
             unique_ptr<Operator> root = Planner(&dbm, *(i.sub));
             Tuple input;
             if(root == nullptr || root->Open())return {0,ERR_ELSE};
+            i.values.clear();
             while(1){
                 int res = root->Next(input);
                 if(res == -1){
@@ -1106,6 +1204,10 @@ pair<int,int> UpdateExecuter(DbManager& dbm, BoundUpdateRequest& bur){
                 if(res == 1){
                     root->Close();
                     break;
+                }
+                if(input.values.size() != 1){
+                    root->Close();
+                    return {0,ERR_ELSE};
                 }
                 i.values.push_back(input.values[0]);
             }
@@ -1129,7 +1231,7 @@ pair<int,int> UpdateExecuter(DbManager& dbm, BoundUpdateRequest& bur){
     }
     root->Close();
     vector<int> cid;
-    Row row = bur.values;
+    Row& row = bur.values;
     for(auto& i:bur.col){
         cid.push_back(i.cid);
     }
@@ -1142,13 +1244,6 @@ pair<int,int> UpdateExecuter(DbManager& dbm, BoundUpdateRequest& bur){
         if(tb->pkid!=-1)indexes.push_back(dbm.id_idx.at(tb->pkid));
         if(dbm.id_normidx.count(tb->id)){
             for(Index* index:dbm.id_normidx[tb->id])if(index->uni)indexes.push_back(index);
-        }
-        for(auto j : indexes){
-            for(int k : j->cid){
-                for(int t:cid){
-                    if(k==t&&rids.size()>1&&j->cid.size()==1)return {0,ERR_DUPULICATE};
-                }
-            }
         }
     }
     for(int i=0;i<rids.size();i++){

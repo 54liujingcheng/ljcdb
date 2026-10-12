@@ -159,7 +159,7 @@ namespace std {
     struct hash<Tuple> {
         std::size_t operator()(const Tuple& p) const noexcept {
             std::size_t seed = 0;
-            for(auto i:p.values){
+            for(auto& i:p.values){
                 hash_combine(seed, i);
             }
             return seed;
@@ -254,7 +254,7 @@ struct Filter : Operator{
             else left.slot = child->col_slot[i.left.col];
             if(right.is_val)right.val = i.right.val;
             else right.slot = child->col_slot[i.right.col];
-            conditions.push_back(tmp);
+            conditions.push_back(move(tmp));
         }
     }
     ~Filter(){
@@ -322,9 +322,9 @@ struct Project : Operator{
     Project(DbManager* dbm, unique_ptr<Operator> ch, BoundSelectRequest& bsr):Operator(dbm){
         child = move(ch);
         int cnt=0;
-        for(auto i:bsr.col_items){
+        for(auto& i:bsr.col_items){
             if(!i.first || i.second != AggregateFunc::NONE)continue;
-            for(auto j:child->layout)
+            for(auto& j:child->layout)
             if(j.col == i.first){
                 layout.push_back(j);
                 input_slots.push_back(child->col_slot.at(j.col.value()));
@@ -423,10 +423,10 @@ struct BNLJ : Operator{
         layout.insert(layout.end(),inner_child->layout.begin(),inner_child->layout.end());
         col_slot = outer_child->col_slot;
         outer_col = outer_child->layout.size();
-        for(auto i:inner_child->col_slot){
+        for(auto& i:inner_child->col_slot){
             col_slot[i.first] = i.second + outer_col;
         }
-        for(auto i:vec){
+        for(auto& i:vec){
             ExeCondition tmp;
             tmp.op = i.op, tmp.pattern = i.pattern, tmp.type = i.type, tmp.values = i.values;
             ExeOperand& left = tmp.left,&right = tmp.right;
@@ -436,12 +436,12 @@ struct BNLJ : Operator{
             else left.slot = col_slot.at(i.left.col);
             if(right.is_val)right.val = i.right.val;
             else right.slot = col_slot.at(i.right.col);
-            conditions.push_back(tmp);
+            conditions.push_back(move(tmp));
         }
         outer_idx = 0;
         finished = 0;
         int total_len = 0;
-        for(auto i:outer_child->layout){
+        for(auto& i:outer_child->layout){
             if(i.col){
                 Table* tb = dbm->id_table[i.col.value().table_id];
                 total_len += tb->mng->tbmeta.schema.desc[i.col.value().cid].len;
@@ -474,7 +474,7 @@ struct BNLJ : Operator{
             int res = outer_child->Next(outer_input);
             if(res == -1)return -1;
             if(res == 1)break;
-            outer_batch.push_back(outer_input);
+            outer_batch.push_back(move(outer_input));
             outer_input.values.clear();
         }
         int res = inner_child->Next(inner_tuple);
@@ -500,7 +500,7 @@ struct BNLJ : Operator{
                     int res = outer_child->Next(outer_input);
                     if(res == -1)return -1;
                     if(res == 1)break;
-                    outer_batch.push_back(outer_input);
+                    outer_batch.push_back(move(outer_input));
                     outer_input.values.clear();
                 }
             }
@@ -646,7 +646,7 @@ struct Sort : Operator{
         }
         int tmp=0;
         int col = layout.size(), nullen = (col+7)/8, offset = nullen;
-        for(auto i:layout){
+        for(auto& i:layout){
             if(i.agg == AggregateFunc::COUNT){
                 slots.push_back({0,4,offset,0}), offset+=4;
             }
@@ -934,11 +934,11 @@ struct Aggregate: Operator{
     Aggregate(DbManager* dbm, unique_ptr<Operator> ch, BoundSelectRequest& bsr) : Operator(dbm) {
         child = move(ch);
         gpkey_aggs.clear();
-        for(auto i:bsr.GROUPBY){
+        for(auto& i:bsr.GROUPBY){
             gpslots.push_back(child->col_slot[i]);
         }
         int tmp=0;
-        for(auto i:bsr.col_items){
+        for(auto& i:bsr.col_items){
             if(i.second != AggregateFunc::NONE){
                 if(!i.first)aggs.push_back({AggregateFunc::COUNT, -1, 0});
                 else aggs.push_back({i.second, child->col_slot[i.first.value()], i.first.value().type});
@@ -1213,7 +1213,7 @@ struct INLJ: Operator{
                 break;
             }
         }
-        for(auto i:vec){
+        for(auto& i:vec){
             ExeCondition tmp;
             tmp.op = i.op, tmp.pattern = i.pattern, tmp.type = i.type, tmp.values = i.values;
             ExeOperand& left = tmp.left,&right = tmp.right;
@@ -1223,7 +1223,7 @@ struct INLJ: Operator{
             else left.slot = col_slot.at(i.left.col);
             if(right.is_val)right.val = i.right.val;
             else right.slot = col_slot.at(i.right.col);
-            conditions.push_back(tmp);
+            conditions.push_back(move(tmp));
         }
         finished = 0;
         record_buf = new char[sc.recordsize];

@@ -57,6 +57,52 @@ struct TableMeta{
     int page;
     Schema schema;
 };
+// Schema is persisted verbatim and is later used as a collection of byte
+// offsets.  Validate all of those offsets before a RecordManager can trust it.
+inline bool IsValidSchema(const Schema& sc){
+    if(sc.col <= 0 || sc.col > 32 || sc.nullen != (sc.col + 7) / 8)
+        return false;
+    if(sc.offset[0] != sc.nullen)
+        return false;
+
+    int expected_offset = sc.nullen;
+    for(int i = 0; i < sc.col; ++i){
+        const Col& col = sc.desc[i];
+        const void* name_end = std::memchr(col.name, '\0', MAX_STR);
+        if(col.name[0] == '\0' || name_end == nullptr)
+            return false;
+        for(int j = 0; j < i; ++j){
+            if(std::strcmp(col.name, sc.desc[j].name) == 0)
+                return false;
+        }
+        if(col.type < 0 || col.type > 3 ||
+           (col.nullable != 0 && col.nullable != 1) ||
+           (col.defalutable != 0 && col.defalutable != 1))
+            return false;
+        if((col.type == 0 && col.len != static_cast<int>(sizeof(int))) ||
+           (col.type == 1 && col.len != static_cast<int>(sizeof(double))) ||
+           (col.type == 2 && (col.len <= 0 || col.len > 2048)) ||
+           (col.type == 3 && col.len != static_cast<int>(sizeof(int))))
+            return false;
+        if(sc.offset[i] != expected_offset ||
+           expected_offset > PAGE_SIZE / 4 - col.len)
+            return false;
+        expected_offset += col.len;
+
+        if(col.defalutable){
+            if(col.default_offset == -1){
+                if(!col.nullable)
+                    return false;
+            }
+            else if(col.default_offset < 0 ||
+                    col.default_offset > static_cast<int>(sizeof(sc.defval)) - col.len){
+                return false;
+            }
+        }
+    }
+    return sc.offset[sc.col] == expected_offset &&
+           sc.recordsize == expected_offset && sc.recordsize <= PAGE_SIZE / 4;
+}
 struct RecordManager{
     int fid;
     int slotbit;

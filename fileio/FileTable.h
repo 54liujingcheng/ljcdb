@@ -75,7 +75,7 @@ public:
 		string name = idToName[fileID];
 		isOpen.erase(name);
 	}
-	string getFormat(string name) {
+	string getFormat(string& name) {
 		for (uint i = 0; i < fname.size(); ++ i) {
 			if (name == fname[i]) {
 				return format[i];
