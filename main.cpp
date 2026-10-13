@@ -80,11 +80,12 @@ int main(int argc, char* argv[]){
     string command,line;
     while(1){
         if(mode == 0){
-            printf("ljcdb:%s>", dbm->dbname.c_str());
+            if(command.empty())printf("ljcdb:%s>", dbm->dbname.c_str());
+            else printf(">");
             fflush(stdout);
         }
         if(!getline(cin,line))break;
-        if(line[0] == '-'&&line[1] == '-')continue;
+        if(line.size() >= 2 && line[0] == '-'&&line[1] == '-')continue;
         while(!line.empty()&&line.back() == ' ')line.pop_back();
         command += line;
         if(line.empty()){
@@ -121,12 +122,6 @@ int main(int argc, char* argv[]){
             }
             command.clear();
             command.clear();
-        }else{
-            if(mode == 0){
-                printf(">");
-                fflush(stdout);
-            }
-            command += " ";
         }
     }
     delete dbm;
