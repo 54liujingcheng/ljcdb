@@ -1,35 +1,34 @@
-#ifndef FILE_MANAGER
-#define FILE_MANAGER
-#include <string>
-#include <stdio.h>
-#include <iostream>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#include <fcntl.h>
-//#include "../MyLinkList.h"
-using namespace std;
+#pragma once
+
+#include "../utils/MyBitMap.h"
+#include "../utils/pagedef.h"
+#include "../utils/platform_io.h"
+
+#include <array>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
+
 class FileManager {
 private:
-	//FileTable* ftable;
-	int fd[MAX_FILE_NUM];
+	std::array<std::FILE*, MAX_FILE_NUM> files{};
 	MyBitMap* fm;
 	MyBitMap* tm;
-	int _createFile(const char* name) {
-		FILE* f = fopen(name, "a+");
-		if (f == NULL) {
-			cout << "fail" << endl;
+	int _createFile(const std::filesystem::path& name) {
+		std::FILE* file = ljcdb::platform::openFile(name, "wb");
+		if (file == nullptr)
 			return -1;
-		}
-		fclose(f);
-		return 0;
+		return std::fclose(file) == 0 ? 0 : -1;
 	}
-	int _openFile(const char* name, int fileID) {
-		int f = open(name, O_RDWR);
-		if (f == -1) {
+	int _openFile(const std::filesystem::path& name, int fileID) {
+		std::FILE* file = ljcdb::platform::openFile(name, "r+b");
+		if (file == nullptr)
 			return -1;
-		}
-		fd[fileID] = f;
+		// Page I/O already has its own buffer pool. Avoid a second buffering
+		// layer and its read/write transition rules in stdio.
+		std::setvbuf(file, nullptr, _IONBF, 0);
+		files[fileID] = file;
 		return 0;
 	}
 public:
@@ -50,16 +49,17 @@ public:
 	 * 返回:成功操作返回0
 	 */
 	int writePage(int fileID, int pageID, BufType buf, int off) {
-		int f = fd[fileID];
-		off_t offset = pageID;
-		offset = (offset << PAGE_SIZE_IDX);
-		off_t error = lseek(f, offset, SEEK_SET);
-		if (error != offset) {
+		if (fileID < 0 || fileID >= MAX_FILE_NUM || pageID < 0 ||
+			buf == nullptr || files[fileID] == nullptr)
 			return -1;
-		}
+		std::FILE* file = files[fileID];
+		const auto offset = static_cast<std::uint64_t>(pageID) * PAGE_SIZE;
+		if (!ljcdb::platform::seekFile(file, offset))
+			return -1;
 		BufType b = buf + off;
-		error = write(f, (void*) b, PAGE_SIZE);
-		return 0;
+		return std::fwrite(static_cast<void*>(b), 1, PAGE_SIZE, file) == PAGE_SIZE
+			? 0
+			: -1;
 	}
 	/*
 	 * @函数名readPage
@@ -71,16 +71,24 @@ public:
 	 * 返回:成功操作返回0
 	 */
 	int readPage(int fileID, int pageID, BufType buf, int off) {
-		//int f = fd[fID[type]];
-		int f = fd[fileID];
-		off_t offset = pageID;
-		offset = (offset << PAGE_SIZE_IDX);
-		off_t error = lseek(f, offset, SEEK_SET);
-		if (error != offset) {
+		if (fileID < 0 || fileID >= MAX_FILE_NUM || pageID < 0 ||
+			buf == nullptr || files[fileID] == nullptr)
 			return -1;
-		}
+		std::FILE* file = files[fileID];
+		const auto offset = static_cast<std::uint64_t>(pageID) * PAGE_SIZE;
+		if (!ljcdb::platform::seekFile(file, offset))
+			return -1;
 		BufType b = buf + off;
-		error = read(f, (void*) b, PAGE_SIZE);
+		const std::size_t bytesRead = std::fread(static_cast<void*>(b), 1, PAGE_SIZE, file);
+		if (bytesRead < PAGE_SIZE) {
+			if (std::ferror(file)) {
+				std::clearerr(file);
+				return -1;
+			}
+			std::memset(reinterpret_cast<unsigned char*>(b) + bytesRead, 0,
+				PAGE_SIZE - bytesRead);
+			std::clearerr(file);
+		}
 		return 0;
 	}
 	/*
@@ -90,10 +98,12 @@ public:
 	 * 返回:操作成功，返回0
 	 */
 	int closeFile(int fileID) {
+		if (fileID < 0 || fileID >= MAX_FILE_NUM || files[fileID] == nullptr)
+			return -1;
+		std::FILE* file = files[fileID];
+		files[fileID] = nullptr;
 		fm->setBit(fileID, 1);
-		int f = fd[fileID];
-		close(f);
-		return 0;
+		return std::fclose(file) == 0 ? 0 : -1;
 	}
 	/*
 	 * @函数名createFile
@@ -101,9 +111,8 @@ public:
 	 * 功能:新建name指定的文件名
 	 * 返回:操作成功，返回true
 	 */
-	bool createFile(const char* name) {
-		_createFile(name);
-		return true;
+	bool createFile(const std::filesystem::path& name) {
+		return _createFile(name) == 0;
 	}
 	/*
 	 * @函数名openFile
@@ -112,10 +121,14 @@ public:
 	 * 功能:打开文件
 	 * 返回:如果成功打开，在fileID中存储为该文件分配的id，返回true，否则返回false
 	 */
-	bool openFile(const char* name, int& fileID) {
+	bool openFile(const std::filesystem::path& name, int& fileID) {
 		fileID = fm->findLeftOne();
+		if (fileID < 0 || fileID >= MAX_FILE_NUM || files[fileID] != nullptr ||
+			_openFile(name, fileID) != 0) {
+			fileID = -1;
+			return false;
+		}
 		fm->setBit(fileID, 0);
-		_openFile(name, fileID);
 		return true;
 	}
 	int newType() {
@@ -127,11 +140,20 @@ public:
 		tm->setBit(typeID, 1);
 	}
 	void shutdown() {
+		for (std::FILE*& file : files) {
+			if (file != nullptr) {
+				std::fclose(file);
+				file = nullptr;
+			}
+		}
 		delete tm;
 		delete fm;
+		tm = nullptr;
+		fm = nullptr;
 	}
+	FileManager(const FileManager&) = delete;
+	FileManager& operator=(const FileManager&) = delete;
 	~FileManager() {
 		this->shutdown();
 	}
 };
-#endif

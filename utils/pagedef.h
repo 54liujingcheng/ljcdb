@@ -1,11 +1,6 @@
 #ifndef PAGE_DEF
 #define PAGE_DEF
-#include <unistd.h>
-#include <errno.h>
-#include <stdio.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <dirent.h>
+#include <cstdio>
 /*
  * 一个页面中的字节数
  */

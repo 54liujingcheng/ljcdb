@@ -6,6 +6,24 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+option(
+    LJCDB_STATIC_WINDOWS_RUNTIME
+    "Link a self-contained C/C++ runtime on Windows"
+    ON
+)
+
+if(MSVC)
+    set(WITH_STATIC_CRT ${LJCDB_STATIC_WINDOWS_RUNTIME} CACHE BOOL
+        "Use the static Visual C++ runtime" FORCE)
+    if(LJCDB_STATIC_WINDOWS_RUNTIME)
+        set(CMAKE_MSVC_RUNTIME_LIBRARY
+            "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    else()
+        set(CMAKE_MSVC_RUNTIME_LIBRARY
+            "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+    endif()
+endif()
+
 # Build only the bundled ANTLR C++ runtime library.  The generated SQL parser
 # is already checked into parser/generated, so Java is not needed to build the
 # database executable.
@@ -44,8 +62,28 @@ set_target_properties(ljcdb PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
+# Multi-config generators (Visual Studio, Ninja Multi-Config) otherwise append
+# a configuration directory such as Release/ below bin/.
+foreach(config Debug Release RelWithDebInfo MinSizeRel)
+    string(TOUPPER "${config}" config_upper)
+    set_target_properties(ljcdb PROPERTIES
+        "RUNTIME_OUTPUT_DIRECTORY_${config_upper}" "${CMAKE_BINARY_DIR}/bin"
+    )
+endforeach()
+
 if(MSVC)
-    target_compile_options(ljcdb PRIVATE /W4)
+    target_compile_options(ljcdb PRIVATE /W4 /permissive- /Zc:__cplusplus /utf-8)
 else()
     target_compile_options(ljcdb PRIVATE -Wall -Wextra)
 endif()
+
+if(WIN32)
+    target_compile_definitions(ljcdb PRIVATE NOMINMAX _CRT_SECURE_NO_WARNINGS)
+endif()
+
+if(WIN32 AND MINGW AND LJCDB_STATIC_WINDOWS_RUNTIME AND
+   CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_link_options(ljcdb PRIVATE -static -static-libgcc -static-libstdc++)
+endif()
+
+install(TARGETS ljcdb RUNTIME DESTINATION .)

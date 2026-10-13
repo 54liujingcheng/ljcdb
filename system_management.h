@@ -46,7 +46,7 @@ struct Table{
     int id;
     char name[MAX_STR];
     unique_ptr<RecordManager> mng;
-    string file_name;
+    fs::path file_name;
     int pkid=-1;
     unordered_map <string, int> name_cid;
     //int Insert(Row row, )
@@ -61,7 +61,7 @@ struct Index{
     int implicit;
     int type;
     unique_ptr<BPT> mng;
-    string file_name;
+    fs::path file_name;
 };
 struct Foreign{
     int id;
@@ -121,8 +121,8 @@ struct DbManager{
         delete idx_bpm;
         delete fm;
     }
-    bool OpenFile(const std::string& path, int& fid) {
-        if (!fm->openFile(path.c_str(), fid))
+    bool OpenFile(const fs::path& path, int& fid) {
+        if (!fm->openFile(path, fid))
             return false;
         opened_fid.insert(fid);
         return true;
@@ -142,15 +142,15 @@ struct DbManager{
         catalog/=".catalog";
         index/=".index";
         foreign/=".foreign";
-        FILE* f = std::fopen(catalog.c_str(),"w");
+        FILE* f = ljcdb::platform::openFile(catalog,"w");
         if(f == nullptr)return -1;
         std::fprintf(f,"0 0");
         std::fclose(f);
-        f = std::fopen(index.c_str(),"w");
+        f = ljcdb::platform::openFile(index,"w");
         if(f == nullptr)return -1;
         std::fprintf(f,"0 0");
         std::fclose(f);
-        f = std::fopen(foreign.c_str(),"w");
+        f = ljcdb::platform::openFile(foreign,"w");
         if(f == nullptr)return -1;
         std::fprintf(f,"0 0");
         std::fclose(f);
@@ -164,7 +164,7 @@ struct DbManager{
         catalog/=".catalog";
         index/=".index";
         foreign/=".foreign";
-        FILE* f = std::fopen(catalog.c_str(),"w");
+        FILE* f = ljcdb::platform::openFile(catalog,"w");
         if(f == nullptr)return -1;
         fprintf(f,"%d %d\n",table_num,next_tableid);
         for(int i=0;i<MAX_TBL;i++){
@@ -174,7 +174,7 @@ struct DbManager{
             table[i].name_cid.clear();
         }
         fclose(f);
-        f = std::fopen(index.c_str(),"w");
+        f = ljcdb::platform::openFile(index,"w");
         if(f == nullptr)return -1;
         fprintf(f,"%d %d\n",idx_num,next_idxid);
         for(int i=0;i<MAX_IDX;i++){
@@ -189,7 +189,7 @@ struct DbManager{
             idx[i].mng.reset();
         }
         fclose(f);
-        f = std::fopen(foreign.c_str(),"w");
+        f = ljcdb::platform::openFile(foreign,"w");
         if(f == nullptr)return -1;
         fprintf(f,"%d %d\n",fk_num,next_fkid);
         for(int i=0;i<MAX_FK;i++){
@@ -241,15 +241,15 @@ struct DbManager{
         foreign/=".foreign";
         if(!fs::exists(catalog) || !fs::exists(index) || !fs::exists(foreign))return -1;
         CloseDb();
-        FILE* f = fopen(catalog.c_str(),"r");
+        FILE* f = ljcdb::platform::openFile(catalog,"r");
         if(f==nullptr)return -1;
         fscanf(f,"%d %d",&table_num,&next_tableid);
         for(int i=0;i<table_num;i++){
             fscanf(f,"%d %s",&table[i].id,table[i].name);
-            table[i].file_name = db / fs::path(table[i].name);
-            table[i].file_name+="_" + to_string(table[i].id) + ".ljcdb";
+            table[i].file_name = db /
+                (string(table[i].name) + "_" + to_string(table[i].id) + ".ljcdb");
             int fid;
-            OpenFile(table[i].file_name.c_str(),fid);
+            OpenFile(table[i].file_name,fid);
             table[i].mng = std::make_unique <RecordManager>(fid, rec_bpm);
             name_table[table[i].name] = table+i;
             id_table[table[i].id] = table+i;
@@ -260,13 +260,14 @@ struct DbManager{
             }
         }
         fclose(f);
-        f = fopen(index.c_str(),"r");
+        f = ljcdb::platform::openFile(index,"r");
         if(f==nullptr)return -1;
         fscanf(f,"%d %d",&idx_num, &next_idxid);
         for(int i=0;i<idx_num;i++){
             fscanf(f,"%d %s %d %d",&idx[i].id, idx[i].name, &idx[i].table_id, &idx[i].col);
             Table* tb = id_table.at(idx[i].table_id);
-            idx[i].file_name =(db / (string(tb->name) + "_" +to_string(idx[i].id) + ".index")).string();
+            idx[i].file_name = db /
+                (string(tb->name) + "_" +to_string(idx[i].id) + ".index");
             //name_idx[idx[i].name] = idx+i;
             for(int j=0;j<idx[i].col;j++){
                 int tmp;
@@ -279,13 +280,13 @@ struct DbManager{
             idname_idx[{idx[i].table_id,idx[i].name}] = idx+i;
             id_idx[idx[i].id] = idx+i;
             int fid;
-            OpenFile(idx[i].file_name.c_str(),fid);
+            OpenFile(idx[i].file_name,fid);
             idx[i].mng = std::make_unique<BPT>(fid,idx_bpm);
             idxbm.set(i,1);
             //name_idx[idx[i].name] = idx+i;
         }
         fclose(f);
-        f = fopen(foreign.c_str(),"r");
+        f = ljcdb::platform::openFile(foreign,"r");
         if(f == nullptr)return -1;
         fscanf(f,"%d %d",&fk_num,&next_fkid);
         for(int i=0;i<fk_num;i++){
@@ -330,9 +331,11 @@ struct DbManager{
         if(tb == 0){errcode = ERR_ELSE;return 0;}
         fs::path path = fs::path("data") / fs::path(dbname) / fs::path(string(name) + "_" + to_string(next_tableid) + ".ljcdb");
         int fid;
-        FILE* f = fopen(path.c_str(),"w");
-        if(f)fclose(f);
-        OpenFile(path,fid);
+        if(!fm->createFile(path) || !OpenFile(path,fid)){
+            tablebm.reset(tb-table);
+            errcode = ERR_ELSE;
+            return nullptr;
+        }
         tb->id = next_tableid++;
         tb->file_name = path;
         tb->pkid = -1;
@@ -409,9 +412,11 @@ struct DbManager{
         if(!ix){errcode = ERR_ELSE;return 0;}
         fs::path path = fs::path("data") / fs::path(dbname) / fs::path(string(tablename) + "_" + to_string(next_idxid) + ".index");
         int fid;
-        FILE* f = fopen(path.c_str(),"w");
-        if(f)fclose(f);
-        OpenFile(path,fid);
+        if(!fm->createFile(path) || !OpenFile(path,fid)){
+            idxbm.reset(ix-idx);
+            errcode = ERR_ELSE;
+            return nullptr;
+        }
         ix->id = next_idxid++;
         ix->table_id = tb->id;
         ix->file_name = path;

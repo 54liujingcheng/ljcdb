@@ -190,14 +190,14 @@ void runSQLJC(DbManager& dbm,string SQLJC, bool mode){//0->交互 1->批处理 o
                 if(mode == 1){
                     printf("INDEXES\n");
                     for(auto& i:dbm.id_idx){
-                        printf("%s\n", i.second->file_name.c_str());
+                        printf("%s\n", i.second->file_name.string().c_str());
                     }
                     printf("@\n");
                 }
                 else{
                     printf("Indexes\n");
                     for(auto& i:dbm.id_idx){
-                        printf("%s\n", i.second->file_name.c_str());
+                        printf("%s\n", i.second->file_name.string().c_str());
                     }
                 }
             }

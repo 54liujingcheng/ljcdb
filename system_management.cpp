@@ -125,10 +125,13 @@ int index_deserialization(char* src, Row& dest, Schema& sc, Index* idx){
     return 0;
 }
 int LoadCSV(DbManager& dbm, const string& table_name, const string& load_path){
-    FILE* f = fopen(load_path.c_str(), "rb");
+    FILE* f = ljcdb::platform::openFile(fs::path(load_path), "rb");
     int cnt=0;
     if(!f)return 0;
-    if(!dbm.name_table.count(table_name))return 0;
+    if(!dbm.name_table.count(table_name)){
+        fclose(f);
+        return 0;
+    }
     Table* tb = dbm.name_table[table_name];
     Schema& sc = tb->mng->tbmeta.schema;
     Row row;

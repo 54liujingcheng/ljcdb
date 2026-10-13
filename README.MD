@@ -48,16 +48,16 @@ flowchart LR
 
 ## 环境要求
 
-- Linux 或 WSL 等 POSIX 环境
+- Windows 10/11、Linux 或 macOS
 - CMake 3.20 或更高版本
-- 支持 C++20 和 `<format>` 的现代 C++ 编译器
+- 支持 C++20 和 `<format>` 的现代 C++ 编译器：Visual Studio 2022、MinGW-w64 GCC 13+、GCC 13+ 或 Clang 17+
 - Git（仅克隆项目时需要）
 
 ANTLR4 生成的 C++ 解析器和 ANTLR4 C++ runtime 已包含在仓库中，正常构建不需要 Java，也不需要另外安装 ANTLR。
 
 ## 快速开始
 
-### 1. 构建
+### 1. 构建（Linux/macOS）
 
 克隆仓库并进入项目根目录后执行：
 
@@ -72,12 +72,43 @@ cmake --build build --parallel
 build/bin/ljcdb
 ```
 
-### 2. 启动交互模式
+### 2. 构建（Windows）
+
+使用 Visual Studio 2022：
+
+```powershell
+cmake -S . -B build/windows-msvc -G "Visual Studio 17 2022" -A x64
+cmake --build build/windows-msvc --config Release --parallel
+```
+
+或者使用 MinGW-w64：
+
+```powershell
+cmake -S . -B build/windows-mingw -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
+cmake --build build/windows-mingw --parallel
+```
+
+两种工具链都会把程序生成到：
+
+```text
+build\windows-msvc\bin\ljcdb.exe
+build\windows-mingw\bin\ljcdb.exe
+```
+
+Windows 构建默认静态链接工具链的 C/C++ 运行库，以便直接复制单个 `ljcdb.exe` 使用。若需要动态运行库，可在配置时添加 `-DLJCDB_STATIC_WINDOWS_RUNTIME=OFF`。
+
+### 3. 启动交互模式
 
 请从项目根目录运行程序，因为数据库文件默认保存在当前目录下的 `data/` 中。
 
 ```bash
 ./build/bin/ljcdb
+```
+
+Windows PowerShell：
+
+```powershell
+.\build\windows-msvc\bin\ljcdb.exe
 ```
 
 SQL 语句可以跨行输入，以分号结束。输入 `exit` 或 `EXIT` 退出。
@@ -88,10 +119,16 @@ USE DEMO;
 SHOW TABLES;
 ```
 
-### 3. 批处理模式
+### 4. 批处理模式
 
 ```bash
 ./build/bin/ljcdb -b < script.sql
+```
+
+Windows `cmd.exe`：
+
+```bat
+build\windows-msvc\bin\ljcdb.exe -b < script.sql
 ```
 
 批处理模式使用课程评测约定的表头、数据、错误信息和 `@` 结束标志。
